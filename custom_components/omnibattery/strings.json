@@ -1498,6 +1498,9 @@
       "smart_predischarge": {
         "name": "Smart Pre-discharge / Anti-curtailment"
       },
+      "arbitrage_charging": {
+        "name": "Price arbitrage charging"
+      },
       "negative_price_charging": {
         "name": "Negative-price opportunistic charging"
       },
@@ -1629,6 +1632,9 @@
           "skipped_full_charge_day": "Skipped – Full charge day",
           "charging_to_setpoint": "Charging to setpoint"
         }
+      },
+      "arbitrage_plan": {
+        "name": "Arbitrage Plan"
       },
       "high_price_discharge_status": {
         "name": "High-Price Sale Status",
@@ -2326,6 +2332,9 @@
       },
       "inverse_max_power": {
         "name": "Max Inverter Output"
+      },
+      "arbitrage_wear_cost": {
+        "name": "Arbitrage wear cost"
       },
       "min_arbitrage_margin": {
         "name": "Minimum Arbitrage Margin"

@@ -270,6 +270,49 @@ def format_predictive_notification_message(
     return (title, message)
 
 
+_ARBITRAGE_REASONS = {
+    "needs_discharge_hold": (
+        "turn on the discharge reserve or price-based discharge, otherwise the "
+        "energy would be used before the dear hours"
+    ),
+    "no_battery_data": "no battery could be read",
+    "no_price_slots": "no future price slots",
+    "no_capacity": "no battery capacity",
+    "no_power": "no charge or discharge power",
+    "no_charge_slots": "no slot is free or cheap enough to buy in",
+    "no_unserved_demand": "the battery and forecast already cover the dear hours",
+    "no_profitable_spread": (
+        "the spread does not repay round-trip losses, wear and the margin"
+    ),
+    "no_room": "no room in the battery without displacing solar",
+    "invalid_efficiency": "invalid round-trip efficiency",
+    "invalid_input": "invalid input",
+}
+
+
+def format_arbitrage_lines(plan, *, unit: str) -> str:
+    """Describe what price arbitrage will buy and what it counts on, or why not."""
+    if plan is None or getattr(plan, "status", None) == "disabled":
+        return ""
+    cost_unit = unit.split("/")[0]
+    if not getattr(plan, "planned", False):
+        reason = _ARBITRAGE_REASONS.get(plan.reason, plan.reason)
+        return f"🔁 Arbitrage: nothing planned ({reason})\n"
+    first = min(plan.discharges, key=lambda d: d.start) if plan.discharges else None
+    last = max(plan.discharges, key=lambda d: d.end) if plan.discharges else None
+    use = (
+        f", used {first.start.strftime('%H:%M')}-{last.end.strftime('%H:%M')} "
+        f"at avg {plan.average_value_price:.4f} {unit}"
+        if first is not None and plan.average_value_price is not None
+        else ""
+    )
+    return (
+        f"🔁 Arbitrage: buy {plan.total_grid_kwh:.2f} kWh from the grid at avg "
+        f"{plan.average_charge_price:.4f} {unit}{use}\n"
+        f"   Expected gain after losses and wear: ~{plan.expected_gain:.2f} {cost_unit}\n"
+    )
+
+
 def format_dynamic_pricing_notification(
     decision_data: dict,
     schedule,
@@ -277,6 +320,7 @@ def format_dynamic_pricing_notification(
     unit: str,
     max_price_threshold,
     discharge_price_threshold,
+    arbitrage_plan=None,
     arbitrage_ceiling=None,
     max_contracted_power,
     max_charge_capacity,
@@ -358,6 +402,11 @@ def format_dynamic_pricing_notification(
                 else ""
             )
             + (
+                f", {float(schedule.slot_arbitrage_kwh[s]):.2f} kWh"
+                if s in getattr(schedule, "slot_arbitrage_kwh", {})
+                else ""
+            )
+            + (
                 f" [before {schedule.slot_deadlines[s].strftime('%H:%M')}]"
                 if getattr(schedule, "slot_deadlines", {}).get(s) is not None
                 else (
@@ -376,7 +425,23 @@ def format_dynamic_pricing_notification(
             )
             for s in schedule.selected_slots
         )
-        if schedule_type == "negative_price":
+        if schedule_type == "arbitrage":
+            title = f"Price arbitrage: {hours_label} selected"
+            message = (
+                f"🔋 Battery: {avg_soc:.0f}% ({usable_energy:.2f} kWh usable)\n"
+                f"No predictive energy deficit is required.\n\n"
+                f"💰 Cheap slots bought for dearer hours:\n{slot_lines}\n\n"
+                f"Average price: {schedule.average_price:.4f} {unit}\n"
+                f"Estimated cost: ~{schedule.estimated_cost:.2f} {cost_unit}\n"
+                f"{price_config_line}"
+                "Max charge power: " + _max_charge_power_str(
+                    max_contracted_power,
+                    max_charge_capacity,
+                    peak_limit,
+                    contracted_label="ICP",
+                )
+            )
+        elif schedule_type == "negative_price":
             title = f"Negative-price charging: {hours_label} selected"
             opportunity_energy = float(
                 getattr(schedule, "negative_price_energy_kwh", 0.0) or 0.0
@@ -457,6 +522,10 @@ def format_dynamic_pricing_notification(
                 )
             )
 
+    arbitrage_text = format_arbitrage_lines(arbitrage_plan, unit=unit)
+    if arbitrage_text:
+        message = f"{message}\n\n{arbitrage_text.rstrip()}"
+
     return (title, message)
 
 
@@ -485,8 +554,12 @@ def format_slot_start_notification(
     )
 
     title = f"Predictive Charging STARTED ({slot.price:.4f} {unit})"
+    arbitrage_kwh = getattr(schedule, "slot_arbitrage_kwh", {}).get(slot)
+    if arbitrage_kwh:
+        title = f"Price arbitrage STARTED ({slot.price:.4f} {unit})"
     message = (
-        f"⚡ Charging at max {min(max_contracted_power, peak_limit) if peak_limit else max_contracted_power:g}W\n"
+        (f"🔁 Buying {arbitrage_kwh:.2f} kWh for dearer hours\n" if arbitrage_kwh else "")
+        + f"⚡ Charging at max {min(max_contracted_power, peak_limit) if peak_limit else max_contracted_power:g}W\n"
         f"Slot: {slot.start.strftime('%H:%M')}-{slot.end.strftime('%H:%M')}\n"
         f"{next_slot_str} · {remaining_str}"
     )

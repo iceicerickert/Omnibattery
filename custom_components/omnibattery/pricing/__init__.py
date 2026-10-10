@@ -14,6 +14,7 @@ PriceSlot = namedtuple("PriceSlot", ["start", "end", "price"])
 SLOT_PURPOSE_DEFICIT = "deficit"
 SLOT_PURPOSE_NEGATIVE_PRICE = "negative_price"
 SLOT_PURPOSE_COMBINED = "combined"
+SLOT_PURPOSE_ARBITRAGE = "arbitrage"
 
 
 @dataclass
@@ -38,6 +39,13 @@ class DynamicPricingSchedule:
     deficit_hours_needed: float = 0.0
     negative_price_hours_needed: float = 0.0
     negative_price_energy_kwh: float = 0.0
+    # Price arbitrage: extra energy bought for a later, dearer use.  Its slots
+    # never overlap a deficit or negative-price slot, so they carry the plain
+    # ``arbitrage`` purpose and their own per-slot battery-side energy.
+    arbitrage_charging_needed: bool = False
+    arbitrage_energy_kwh: float = 0.0
+    slot_arbitrage_kwh: dict = field(default_factory=dict)
+    arbitrage_plan: object = None
     slot_energy_targets_kwh: dict = field(default_factory=dict)
     slot_deadlines: dict = field(default_factory=dict)
     slot_plan_kinds: dict = field(default_factory=dict)
@@ -79,6 +87,7 @@ __all__ = [
     "SLOT_PURPOSE_DEFICIT",
     "SLOT_PURPOSE_NEGATIVE_PRICE",
     "SLOT_PURPOSE_COMBINED",
+    "SLOT_PURPOSE_ARBITRAGE",
     "BatterySnapshot",
     "CurtailmentPlan",
     "PreDischargeSlot",
