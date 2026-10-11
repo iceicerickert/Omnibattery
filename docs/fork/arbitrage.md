@@ -34,32 +34,67 @@ This feature uses the price your sensor reports for importing and nothing else. 
 
 ## Dashboard card
 
-The attributes feed a card on your own dashboard. This one needs no custom cards:
+The attributes feed a card on your own dashboard. This one needs no custom cards. It also reads the predictive-charging and discharge-reserve status sensors, so when nothing is planned it shows why in plain language, with the battery, demand and already-planned grid charge next to it. Adjust the three entity ids at the top if yours differ:
 
 ```yaml
 type: markdown
 title: Arbitrage plan
-content: >-
-  {% set s = 'sensor.omnibattery_arbitrage_plan' %}
-  {% set a = state_attr(s, 'charges') or [] %}
-  {% set d = state_attr(s, 'discharges') or [] %}
-  **Status:** {{ states(s) }}{% if state_attr(s, 'reason') %} ({{ state_attr(s, 'reason') }}){% endif %}
-
+content: |-
+  {% set p = 'sensor.omnibattery_arbitrage_plan' %}
+  {% set pc = 'binary_sensor.omnibattery_predictive_charging_active' %}
+  {% set dr = 'binary_sensor.omnibattery_discharge_reserve_status' %}
+  {% set st = states(p) %}
+  {% set reason = state_attr(p, 'reason') %}
+  {% set committed = state_attr(p, 'committed_charge_kwh') | float(0) %}
+  {% set why = state_attr(pc, 'decision_reason') %}
+  {% set usable = state_attr(pc, 'usable_energy_kwh') | float(0) %}
+  {% set demand = state_attr(dr, 'horizon_demand_kwh') | float(0) %}
+  {% set texts = {
+    'no_unserved_demand': 'Nothing extra to buy. The battery plus the grid charge already planned cover everything the house needs until sunrise.',
+    'no_profitable_spread': 'Not worth it. The gap between cheap and dear hours is too small after round-trip losses, wear cost and margin.',
+    'needs_discharge_hold': 'Turn on the Discharge Reserve or Price-Based Discharge. Without one of them the house would use the cheap energy before the dear hours.',
+    'no_charge_slots': 'No cheap period is free to buy in (they are used by other charging, or above your max price).',
+    'no_room': 'No room in the battery without pushing out solar.',
+    'no_battery_data': 'No battery could be read.',
+    'no_price_slots': 'No future prices available.',
+    'no_capacity': 'No battery capacity available.',
+    'no_power': 'No charge or discharge power available.'
+  } %}
+  {% if st == 'planned' %}
+  ## ✅ Planned: expected gain €{{ state_attr(p, 'expected_gain') | float(0) | round(2) }}
+  Buying {{ state_attr(p, 'total_grid_kwh') }} kWh from the grid.
+  {% elif st == 'disabled' %}
+  ## ⏸ Off
+  Switch on *Price arbitrage charging* to use it.
+  {% else %}
+  ## 💤 Not buying extra
+  {{ texts.get(reason, reason) }}
+  {% endif %}
+  {% if st != 'disabled' %}
+  | Right now | |
+  |---|---|
+  | Usable energy in battery | {{ usable | round(1) }} kWh |
+  | House demand until sunrise | {{ demand | round(1) }} kWh |
+  | Grid charge already planned | {{ committed | round(1) }} kWh |
+  {% endif %}
+  {% if st != 'planned' and committed > 0 and why %}
+  **Why charge is planned already:** {{ why }}
+  {% endif %}
+  {% set a = state_attr(p, 'charges') or [] %}
+  {% set d = state_attr(p, 'discharges') or [] %}
   {% if a %}
-  **Expected gain:** {{ state_attr(s, 'expected_gain') | round(2) }}
-  · **Buy:** {{ state_attr(s, 'total_grid_kwh') }} kWh from the grid
-
   | Buy | Price | kWh |
   |---|---|---|
   {% for c in a -%}
-  | {{ as_timestamp(c.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(c.end) | timestamp_custom('%H:%M') }} | {{ c.price }} | {{ c.stored_kwh }} |
+  | {{ as_timestamp(c.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(c.end) | timestamp_custom('%H:%M') }} | {{ c.price | round(3) }} | {{ c.stored_kwh }} |
   {% endfor %}
   | Use | Price | kWh |
   |---|---|---|
   {% for x in d -%}
-  | {{ as_timestamp(x.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(x.end) | timestamp_custom('%H:%M') }} | {{ x.price }} | {{ x.stored_kwh }} |
+  | {{ as_timestamp(x.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(x.end) | timestamp_custom('%H:%M') }} | {{ x.price | round(3) }} | {{ x.stored_kwh }} |
   {% endfor %}
   {% endif %}
+  _Updated {{ as_timestamp(state_attr(p, 'evaluation_time')) | timestamp_custom('%H:%M') if state_attr(p, 'evaluation_time') else '-' }}_
 ```
 
 With [ApexCharts card](https://github.com/RomRider/apexcharts-card) the same attributes give a price curve with the buy and use periods marked:
