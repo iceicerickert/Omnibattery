@@ -1197,3 +1197,261 @@ def test_reload_withdraws_the_plan_when_the_mode_is_no_longer_dynamic_pricing():
         True, 0.0, _data(predictive_charging_mode="realtime_price")
     )
     left._pricing_mgr.clear_arbitrage_runtime.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Hourly arbitrage-only refresh
+# ---------------------------------------------------------------------------
+
+
+def _refreshable(ctrl: SimpleNamespace, slots: list[PriceSlot]) -> PricingManager:
+    ctrl._dynamic_pricing_evaluated_date = datetime.now().date()
+    return _manager(ctrl, slots)
+
+
+def test_refresh_is_due_only_when_the_feature_runs_and_an_hour_has_passed():
+    ctrl = _controller([_Battery("b1", 20, 10)])
+    manager = _refreshable(ctrl, _future_slots(PRICES))
+    now = datetime.now()
+
+    assert manager._arbitrage_refresh_due(now) is True
+
+    ctrl._dp_arbitrage_refreshed_at = now - timedelta(minutes=59)
+    assert manager._arbitrage_refresh_due(now) is False
+    ctrl._dp_arbitrage_refreshed_at = now - timedelta(minutes=60)
+    assert manager._arbitrage_refresh_due(now) is True
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda c: setattr(c, "arbitrage_charging_enabled", False),
+        lambda c: setattr(c, "predictive_charging_overridden", True),
+        lambda c: setattr(c, "_dynamic_pricing_evaluated_date", None),
+        lambda c: setattr(c, "_current_price_slot_active", True),
+        lambda c: setattr(c, "predictive_charging_mode", "realtime_price"),
+    ],
+)
+def test_refresh_is_not_due_when_something_else_owns_the_moment(mutate):
+    ctrl = _controller([_Battery("b1", 20, 10)])
+    manager = _refreshable(ctrl, _future_slots(PRICES))
+    mutate(ctrl)
+    assert manager._arbitrage_refresh_due(datetime.now()) is False
+
+
+def test_a_full_evaluation_counts_as_a_refresh():
+    ctrl = _controller([_Battery("b1", 20, 10)])
+    manager = _evaluate(ctrl, _future_slots(PRICES))
+    assert ctrl._dp_arbitrage_refreshed_at is not None
+    assert manager._arbitrage_refresh_due(datetime.now()) is False
+
+
+def test_refresh_creates_a_schedule_when_there_was_none():
+    ctrl = _controller([_Battery("b1", 20, 10)])
+    slots = _future_slots(PRICES)
+    manager = _refreshable(ctrl, slots)
+    assert ctrl._dynamic_pricing_schedule is None
+
+    manager._refresh_arbitrage_plan(datetime.now())
+
+    schedule = ctrl._dynamic_pricing_schedule
+    assert schedule is not None
+    assert _arbitrage_slots(schedule)
+    assert schedule.schedule_type == SLOT_PURPOSE_ARBITRAGE
+    assert schedule.charging_needed is True
+    assert schedule.deficit_charging_needed is False
+    assert schedule.arbitrage_charging_needed is True
+    assert schedule.arbitrage_energy_kwh == pytest.approx(sum(schedule.slot_arbitrage_kwh.values()))
+    assert schedule.arbitrage_plan is ctrl._dp_last_arbitrage_plan
+    assert schedule.estimated_cost == pytest.approx(
+        sum(c.grid_kwh * c.price for c in schedule.arbitrage_plan.charges)
+    )
+    assert ctrl._dp_arbitrage_refreshed_at is not None
+
+
+def test_refresh_leaves_deficit_slots_exactly_as_they_were():
+    ctrl = _controller(
+        [_Battery("b1", 20, 20)],
+        decision=_decision(should_charge=True, deficit=1.0),
+    )
+    manager = _evaluate(ctrl, _future_slots(PRICES))
+    schedule = ctrl._dynamic_pricing_schedule
+    deficit_before = {
+        slot: schedule.purpose_for(slot)
+        for slot in schedule.selected_slots
+        if schedule.purpose_for(slot) == SLOT_PURPOSE_DEFICIT
+    }
+    targets_before = dict(schedule.slot_energy_targets_kwh)
+    assert deficit_before
+
+    ctrl._dp_arbitrage_refreshed_at = datetime.now() - timedelta(hours=2)
+    manager._refresh_arbitrage_plan(datetime.now())
+
+    after = ctrl._dynamic_pricing_schedule
+    assert {
+        slot: after.purpose_for(slot)
+        for slot in after.selected_slots
+        if after.purpose_for(slot) == SLOT_PURPOSE_DEFICIT
+    } == deficit_before
+    assert after.slot_energy_targets_kwh == targets_before
+    assert SLOT_PURPOSE_COMBINED not in after.slot_purposes.values()
+    assert after.selected_slots == sorted(after.selected_slots, key=lambda s: s.start)
+    assert after.deficit_charging_needed is True
+
+
+def test_refresh_changes_nothing_when_the_plan_is_the_same():
+    ctrl = _controller([_Battery("b1", 20, 10)])
+    slots = _future_slots(PRICES)
+    manager = _evaluate(ctrl, slots)
+    schedule = ctrl._dynamic_pricing_schedule
+    slot = _arbitrage_slots(schedule)[0]
+    ctrl._dp_pre_evaluated_purposes[slot.start] = SLOT_PURPOSE_ARBITRAGE
+    selected = list(schedule.selected_slots)
+    energy = dict(schedule.slot_arbitrage_kwh)
+
+    manager._refresh_arbitrage_plan(datetime.now())
+
+    assert ctrl._dynamic_pricing_schedule is schedule
+    assert schedule.selected_slots == selected
+    assert schedule.slot_arbitrage_kwh == energy
+    # A verdict taken an hour ahead is not thrown away without a reason.
+    assert ctrl._dp_pre_evaluated_purposes[slot.start] == SLOT_PURPOSE_ARBITRAGE
+
+
+def test_refresh_withdraws_future_slots_that_stopped_being_worth_it():
+    battery = _Battery("b1", 20, 10)
+    ctrl = _controller([battery])
+    slots = _future_slots(PRICES)
+    manager = _evaluate(ctrl, slots)
+    stale = _arbitrage_slots(ctrl._dynamic_pricing_schedule)[0]
+    ctrl._dp_pre_evaluated_purposes[stale.start] = SLOT_PURPOSE_ARBITRAGE
+    battery.data["battery_soc"] = 100  # the sun filled it
+
+    manager._refresh_arbitrage_plan(datetime.now())
+
+    assert ctrl._dynamic_pricing_schedule is None
+    assert stale.start not in ctrl._dp_pre_evaluated_purposes
+    assert ctrl._dp_last_arbitrage_plan.planned is False
+
+
+def test_refresh_adds_slots_that_became_worthwhile_since_the_morning():
+    battery = _Battery("b1", 100, 10)  # full this morning: nothing planned
+    ctrl = _controller([battery])
+    slots = _future_slots(PRICES)
+    manager = _evaluate(ctrl, slots)
+    assert not _arbitrage_slots(ctrl._dynamic_pricing_schedule) if ctrl._dynamic_pricing_schedule else True
+
+    battery.data["battery_soc"] = 20  # the house drained it
+    ctrl._dp_arbitrage_refreshed_at = datetime.now() - timedelta(hours=1)
+    manager._refresh_arbitrage_plan(datetime.now())
+
+    assert _arbitrage_slots(ctrl._dynamic_pricing_schedule)
+
+
+def test_refresh_never_touches_a_slot_that_has_started():
+    battery = _Battery("b1", 100, 10)
+    ctrl = _controller([battery])
+    live = _live_slot()
+    later = _future_arb_slot(3.0)
+    schedule = _arb_schedule(live, 1.0)
+    schedule.selected_slots.append(later)
+    schedule.slot_purposes[later] = SLOT_PURPOSE_ARBITRAGE
+    schedule.slot_arbitrage_kwh[later] = 1.0
+    ctrl._dynamic_pricing_schedule = schedule
+    manager = _refreshable(ctrl, [live, later, *_future_slots(PRICES, offset_h=6)])
+
+    manager._refresh_arbitrage_plan(datetime.now())
+
+    kept = ctrl._dynamic_pricing_schedule
+    assert kept.selected_slots == [live]
+    assert kept.slot_arbitrage_kwh == {live: 1.0}
+
+
+def test_refresh_respects_solar_risk_windows():
+    ctrl = _controller([_Battery("b1", 20, 10)])
+    slots = _future_slots(PRICES)
+    manager = _refreshable(ctrl, slots)
+    risky = {slots[0], slots[1], slots[2]}
+    manager._slot_overlaps_curtailment_risk = lambda slot: slot in risky
+
+    manager._refresh_arbitrage_plan(datetime.now())
+
+    schedule = ctrl._dynamic_pricing_schedule
+    chosen = _arbitrage_slots(schedule) if schedule else []
+    assert not set(chosen) & risky
+
+
+def test_refresh_does_not_offer_another_purposes_slots():
+    ctrl = _controller(
+        [_Battery("b1", 20, 20)],
+        decision=_decision(should_charge=True, deficit=2.0),
+    )
+    manager = _evaluate(ctrl, _future_slots(PRICES))
+    schedule = ctrl._dynamic_pricing_schedule
+    owned = {s for s in schedule.selected_slots if schedule.purpose_for(s) != SLOT_PURPOSE_ARBITRAGE}
+    manager._refresh_arbitrage_plan(datetime.now())
+    after = ctrl._dynamic_pricing_schedule
+    assert not owned & set(_arbitrage_slots(after))
+
+
+def test_refresh_without_prices_does_nothing():
+    ctrl = _controller([_Battery("b1", 20, 10)])
+    manager = _refreshable(ctrl, [])
+    manager._refresh_arbitrage_plan(datetime.now())
+    assert ctrl._dynamic_pricing_schedule is None
+    assert ctrl._dp_arbitrage_refreshed_at is not None  # do not retry every cycle
+
+
+def test_control_loop_refreshes_once_an_hour_and_survives_a_failure():
+    ctrl = _controller([_Battery("b1", 12, 10)])
+    slot = _live_slot()
+    manager = _runtime(ctrl, slot, 1.0, [])
+    ctrl._dynamic_pricing_schedule = None  # nothing running, nothing planned
+    ctrl._dp_arbitrage_refreshed_at = None
+    manager.get_future_price_slots = lambda horizon_end=None: _future_slots(PRICES)
+    manager.energy_horizon_end = lambda now: now + timedelta(hours=40)
+    calls: list = []
+    real = manager._refresh_arbitrage_plan
+
+    def counted(now):
+        calls.append(now)
+        real(now)
+
+    manager._refresh_arbitrage_plan = counted
+
+    asyncio.run(manager.handle_dynamic_pricing_predictive_charging())
+    asyncio.run(manager.handle_dynamic_pricing_predictive_charging())
+    assert len(calls) == 1
+    assert ctrl._dynamic_pricing_schedule is not None
+
+    def boom(now):
+        raise RuntimeError("planner exploded")
+
+    manager._refresh_arbitrage_plan = boom
+    ctrl._dp_arbitrage_refreshed_at = datetime.now() - timedelta(hours=2)
+    asyncio.run(manager.handle_dynamic_pricing_predictive_charging())  # must not raise
+    assert datetime.now() - ctrl._dp_arbitrage_refreshed_at < timedelta(minutes=1)
+
+
+def test_midnight_reset_drops_arbitrage_energy_of_slots_it_removes():
+    ctrl = _controller([_Battery("b1", 50, 10)])
+    now = datetime.now()
+    old = PriceSlot(now - timedelta(days=1, hours=2), now - timedelta(days=1, hours=1), 0.1)
+    new = PriceSlot(now + timedelta(hours=1), now + timedelta(hours=2), 0.1)
+    schedule = _arb_schedule(old, 1.0)
+    schedule.selected_slots.append(new)
+    schedule.slot_purposes[new] = SLOT_PURPOSE_ARBITRAGE
+    schedule.slot_arbitrage_kwh[new] = 1.0
+    ctrl._dynamic_pricing_schedule = schedule
+    ctrl._dynamic_pricing_evaluated_date = now.date() - timedelta(days=1)
+    manager = _runtime(ctrl, new, 1.0, [])
+    manager.clear_curtailment_runtime = lambda *args, **kwargs: None
+    ctrl._dynamic_pricing_schedule = schedule
+    ctrl._dynamic_pricing_evaluated_date = now.date() - timedelta(days=1)
+    ctrl._dp_arbitrage_refreshed_at = now
+
+    asyncio.run(manager.handle_dynamic_pricing_predictive_charging())
+
+    assert old not in schedule.selected_slots
+    assert old not in schedule.slot_arbitrage_kwh
+    assert new in schedule.slot_arbitrage_kwh

@@ -11,6 +11,8 @@ Changes carried by this fork on top of upstream (ffunes/Omnibattery). Kept in it
   - Entities: switch `arbitrage_charging`, number `arbitrage_wear_cost`, diagnostic sensor `arbitrage_plan` (attributes feed a dashboard card).
   - Re-planned one hour before each arbitrage slot and with every plan rebuild; needs the Discharge Reserve or Price-Based Discharge.
   - Notifications gained an arbitrage section; diagnostics export the new fields.
+  - Arbitrage is re-planned every hour on its own (arbitrage slots only), not just on full plan rebuilds.
+  - The dashboard card explains why nothing is planned (battery, demand, already-planned grid charge).
 
 ### Known gaps / later
 
