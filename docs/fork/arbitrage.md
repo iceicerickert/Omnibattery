@@ -47,7 +47,7 @@ content: |-
   {% set reason = state_attr(p, 'reason') %}
   {% set committed = state_attr(p, 'committed_charge_kwh') | float(0) %}
   {% set why = state_attr(pc, 'decision_reason') %}
-  {% set usable = state_attr(pc, 'usable_energy_kwh') | float(0) %}
+  {% set usable = state_attr(dr, 'usable_energy_kwh') | float(0) %}
   {% set demand = state_attr(dr, 'horizon_demand_kwh') | float(0) %}
   {% set texts = {
     'no_unserved_demand': 'Nothing extra to buy. The battery plus the grid charge already planned cover everything the house needs until sunrise.',
@@ -73,8 +73,8 @@ content: |-
   {% if st != 'disabled' %}
   | Right now | |
   |---|---|
-  | Usable energy in battery | {{ usable | round(1) }} kWh |
-  | House demand until sunrise | {{ demand | round(1) }} kWh |
+  | Usable energy in battery (live) | {{ usable | round(1) }} kWh |
+  | House demand in priced hours | {{ demand | round(1) }} kWh |
   | Grid charge already planned | {{ committed | round(1) }} kWh |
   {% endif %}
   {% if st != 'planned' and committed > 0 and why %}
