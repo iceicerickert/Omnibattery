@@ -21,6 +21,7 @@ Changes carried by this fork on top of upstream (ffunes/Omnibattery). Kept in it
 - Translations only for English and Dutch; other languages fall back to English.
 - Docs are English only.
 
+
 ### Files touched in shared code (where upstream merges may conflict)
 
 `__init__.py`, `pricing/engine.py`, `pricing/__init__.py`, `pricing/notifications.py`, `switch.py`, `number.py`, `sensor.py`, `diagnostics.py`, `const/integration_const.py`, `strings.json`, `translations/en.json`, `translations/nl.json`.
