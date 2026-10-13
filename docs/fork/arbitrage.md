@@ -34,7 +34,7 @@ This feature uses the price your sensor reports for importing and nothing else. 
 
 ## Dashboard card
 
-The attributes feed a card on your own dashboard. This one needs no custom cards. It also reads the predictive-charging, discharge-reserve, High-Price Sale and integration-status entities: when nothing is planned it says why in plain language (battery, demand, already-planned grid charge), and a Discharge section shows what the battery is doing now, how much the reserve holds back and any planned sales:
+The attributes feed a card on your own dashboard. This one needs no custom cards. It also reads the predictive-charging, discharge-reserve, High-Price Sale and integration-status entities: when nothing is planned it says why in plain language (battery, demand, already-planned grid charge), a Price spread section shows the cheapest and dearest hours until sunrise and the best buy-then-use trade against your margin (it reads your price sensor's quarter-hourly forecast), and a Discharge section shows what the battery is doing now, how much the reserve holds back and any planned sales:
 
 ```yaml
 type: markdown
@@ -45,6 +45,10 @@ content: |-
   {% set dr = 'binary_sensor.omnibattery_discharge_reserve_status' %}
   {% set hp = 'sensor.omnibattery_high_price_discharge_status' %}
   {% set ist = 'sensor.omnibattery_integration_status' %}
+  {% set price = 'sensor.zonneplan_current_quarter_hourly_electricity_tariff' %}
+  {% set rte = states('number.omnibattery_round_trip_efficiency') | float(0.85) %}
+  {% set wear = states('number.omnibattery_arbitrage_wear_cost') | float(0) %}
+  {% set margin = states('number.omnibattery_min_arbitrage_margin') | float(0) %}
   {% set st = states(p) %}
   {% set reason = state_attr(p, 'reason') %}
   {% set committed = state_attr(p, 'committed_charge_kwh') | float(0) %}
@@ -110,6 +114,39 @@ content: |-
   {% for x in d -%}
   | {{ as_timestamp(x.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(x.end) | timestamp_custom('%H:%M') }} | {{ x.price | round(3) }} | {{ x.stored_kwh }} |
   {% endfor %}
+  {% endif %}
+  ---
+  ### Price spread
+  {% set fc = state_attr(price, 'forecast') or [] %}
+  {% set nowts = as_timestamp(now()) %}
+  {% set endts = as_timestamp(state_attr(dr, 'horizon_end')) if state_attr(dr, 'horizon_end') else nowts + 86400 %}
+  {% set ns = namespace(minp=none, minat='', lo=none, loat='', hi=none, hiat='', best=none, buy='', buyp=0, use='', usep=0) %}
+  {% for e in fc if as_timestamp(e.end_date) > nowts and as_timestamp(e.start_date) < endts %}
+  {% set pr = (e.price_tax_included.amount if e.price_tax_included is defined else e.electricity_price) / 10000000 %}
+  {% if ns.minp is not none %}
+  {% set net = rte * pr - ns.minp - wear %}
+  {% if ns.best is none or net > ns.best %}
+  {% set ns.best = net %}{% set ns.buy = ns.minat %}{% set ns.buyp = ns.minp %}{% set ns.use = e.start_date %}{% set ns.usep = pr %}
+  {% endif %}
+  {% endif %}
+  {% if ns.minp is none or pr < ns.minp %}{% set ns.minp = pr %}{% set ns.minat = e.start_date %}{% endif %}
+  {% if ns.lo is none or pr < ns.lo %}{% set ns.lo = pr %}{% set ns.loat = e.start_date %}{% endif %}
+  {% if ns.hi is none or pr > ns.hi %}{% set ns.hi = pr %}{% set ns.hiat = e.start_date %}{% endif %}
+  {% endfor %}
+  {% if ns.lo is none %}
+  No price forecast found on `{{ price }}`.
+  {% else %}
+  | Until next sunrise | When | Price |
+  |---|---|---|
+  | Cheapest | {{ as_timestamp(ns.loat) | timestamp_custom('%a %H:%M') }} | €{{ ns.lo | round(3) }} |
+  | Dearest | {{ as_timestamp(ns.hiat) | timestamp_custom('%a %H:%M') }} | €{{ ns.hi | round(3) }} |
+
+  {% if ns.best is not none and ns.usep > ns.buyp %}
+  **Best buy → use:** {{ as_timestamp(ns.buy) | timestamp_custom('%a %H:%M') }} at €{{ ns.buyp | round(3) }} → {{ as_timestamp(ns.use) | timestamp_custom('%a %H:%M') }} at €{{ ns.usep | round(3) }}. Gross spread €{{ (ns.usep - ns.buyp) | round(3) }}, **net €{{ ns.best | round(3) }} per kWh** after losses and wear. {{ '✅ clears' if ns.best >= margin else '❌ below' }} your margin of €{{ margin | round(3) }}.
+  {% else %}
+  **Best buy → use:** no dearer hour comes after a cheaper one.
+  {% endif %}
+  To pay off when buying at the cheapest price (€{{ ns.lo | round(3) }}), the use price must be at least **€{{ ((ns.lo + wear + margin) / rte) | round(3) }}** (spread €{{ (((ns.lo + wear + margin) / rte) - ns.lo) | round(3) }}).
   {% endif %}
   ---
   ### Discharge
