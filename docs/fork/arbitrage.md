@@ -38,145 +38,105 @@ The attributes feed a card on your own dashboard. This one needs no custom cards
 
 ```yaml
 type: markdown
-title: Arbitrage plan
+title: Battery & prices
 content: |-
-  {% set p = 'sensor.omnibattery_arbitrage_plan' %}
-  {% set pc = 'binary_sensor.omnibattery_predictive_charging_active' %}
-  {% set dr = 'binary_sensor.omnibattery_discharge_reserve_status' %}
-  {% set hp = 'sensor.omnibattery_high_price_discharge_status' %}
-  {% set ist = 'sensor.omnibattery_integration_status' %}
-  {% set price = 'sensor.zonneplan_current_quarter_hourly_electricity_tariff' %}
-  {% set rte = states('number.omnibattery_round_trip_efficiency') | float(0.85) %}
-  {% set wear = states('number.omnibattery_arbitrage_wear_cost') | float(0) %}
-  {% set margin = states('number.omnibattery_min_arbitrage_margin') | float(0) %}
-  {% set st = states(p) %}
-  {% set reason = state_attr(p, 'reason') %}
-  {% set committed = state_attr(p, 'committed_charge_kwh') | float(0) %}
-  {% set why = state_attr(pc, 'decision_reason') %}
-  {% set usable = state_attr(dr, 'usable_energy_kwh') | float(0) %}
-  {% set demand = state_attr(dr, 'horizon_demand_kwh') | float(0) %}
-  {% set need = demand / (rte ** 0.5) %}
-  {% set have = usable + committed %}
-  {% set texts = {
-    'no_unserved_demand': 'Nothing extra to buy. The battery plus the grid charge already planned cover everything the house needs in the hours that have prices.',
-    'no_profitable_spread': 'Not worth it. The gap between cheap and dear hours is too small after round-trip losses, wear cost and margin.',
-    'needs_discharge_hold': 'Turn on the Discharge Reserve or Price-Based Discharge. Without one of them the house would use the cheap energy before the dear hours.',
-    'no_charge_slots': 'No cheap period is free to buy in (they are used by other charging, or above your max price).',
-    'no_room': 'No room in the battery without pushing out solar.',
-    'no_battery_data': 'No battery could be read.',
-    'no_price_slots': 'No future prices available.',
-    'no_capacity': 'No battery capacity available.',
-    'no_power': 'No charge or discharge power available.'
+  {%- set p = 'sensor.omnibattery_arbitrage_plan' %}
+  {%- set pc = 'binary_sensor.omnibattery_predictive_charging_active' %}
+  {%- set dr = 'binary_sensor.omnibattery_discharge_reserve_status' %}
+  {%- set hp = 'sensor.omnibattery_high_price_discharge_status' %}
+  {%- set ist = 'sensor.omnibattery_integration_status' %}
+  {%- set price = 'sensor.zonneplan_current_quarter_hourly_electricity_tariff' %}
+  {%- set rte = states('number.omnibattery_round_trip_efficiency') | float(0.85) %}
+  {%- set wear = states('number.omnibattery_arbitrage_wear_cost') | float(0) %}
+  {%- set margin = states('number.omnibattery_min_arbitrage_margin') | float(0) %}
+  {%- set st = states(p) %}
+  {%- set reason = state_attr(p, 'reason') %}
+  {%- set committed = state_attr(p, 'committed_charge_kwh') | float(0) %}
+  {%- set why = state_attr(pc, 'decision_reason') | string %}
+  {%- set cause = 'weekly full charge' if 'Weekly' in why else 'forecast deficit' if 'deficit' in why else 'plan' %}
+  {%- set usable = state_attr(dr, 'usable_energy_kwh') | float(0) %}
+  {%- set need = state_attr(dr, 'horizon_demand_kwh') | float(0) / (rte ** 0.5) %}
+  {%- set left = usable + committed - need %}
+  {%- set texts = {
+    'no_unserved_demand': 'battery + planned charge already cover the demand',
+    'no_profitable_spread': 'price gap too small after losses, wear and margin',
+    'needs_discharge_hold': 'turn on Discharge Reserve or Price-Based Discharge',
+    'no_charge_slots': 'no free cheap slot to buy in',
+    'no_room': 'no room without pushing out solar'
   } %}
-  {% set hold_texts = {
-    'nothing_dearer_ahead': 'no hour ahead is dear enough to hold for',
-    'reserved_for_dearer_hours': 'energy is held for dearer hours',
-    'pv_refills_in_time': 'solar will refill the battery in time',
-    'no_future_demand': 'no demand expected',
-    'no_usable_energy': 'no usable energy',
-    'no_current_price': 'current price unknown'
-  } %}
-  {% set status_texts = {
-    'price_discharge_blocked': '⛔ Discharge blocked: price is at or below your threshold',
-    'price_reserve_hold': '🔒 Holding energy for dearer hours',
-    'discharging': '🔋 Discharging to the house',
-    'charging': '🔌 Charging',
-    'balanced': '⚖️ Balanced, battery idle'
+  {%- set status_texts = {
+    'price_discharge_blocked': '⛔ blocked, price too low',
+    'price_reserve_hold': '🔒 holding for dearer hours',
+    'discharging': '🔋 discharging',
+    'charging': '🔌 charging',
+    'balanced': '⚖️ idle'
   } %}
   {% if st == 'planned' %}
-  ## ✅ Planned: expected gain €{{ state_attr(p, 'expected_gain') | float(0) | round(2) }}
-  Buying {{ state_attr(p, 'total_grid_kwh') }} kWh from the grid.
+  ## ✅ Buying {{ state_attr(p, 'total_grid_kwh') }} kWh cheap · +€{{ state_attr(p, 'expected_gain') | float(0) | round(2) }}
   {% elif st == 'disabled' %}
-  ## ⏸ Off
-  Switch on *Price arbitrage charging* to use it.
+  ## ⏸ Arbitrage off
   {% else %}
-  ## 💤 Not buying extra
+  ## 💤 No extra buying
   {{ texts.get(reason, reason) }}
   {% endif %}
+
   {% if st != 'disabled' %}
-  | Right now | |
-  |---|---|
-  | Usable energy in battery (live) | {{ usable | round(1) }} kWh |
-  | House demand in priced hours | {{ demand | round(1) }} kWh |
-  | Grid charge already planned | {{ committed | round(1) }} kWh |
-  | **Needed from the battery** (demand after losses) | {{ need | round(1) }} kWh |
-  | **Available** (battery + planned charge) | {{ have | round(1) }} kWh |
-  | **Left over** | {{ '+' if have >= need else '' }}{{ (have - need) | round(1) }} kWh |
+  | Energy until tomorrow's prices | |
+  |---|--:|
+  | Battery, usable now | {{ usable | round(1) }} kWh |
+  | + Planned grid charge{{ ' (' ~ cause ~ ')' if committed > 0 else '' }} | {{ committed | round(1) }} kWh |
+  | − House demand, after losses | {{ need | round(1) }} kWh |
+  | **= Left over** | **{{ '+' if left >= 0 else '' }}{{ left | round(1) }} kWh** |
   {% endif %}
-  {% if st != 'planned' and committed > 0 and why %}
-  **Why charge is planned already:** {{ why }}
-  {% endif %}
-  {% set a = state_attr(p, 'charges') or [] %}
-  {% set d = state_attr(p, 'discharges') or [] %}
+  {%- set a = state_attr(p, 'charges') or [] %}
+  {%- set d = state_attr(p, 'discharges') or [] %}
   {% if a %}
-  | Buy | Price | kWh |
-  |---|---|---|
+
+  **Buy:**
   {% for c in a -%}
-  | {{ as_timestamp(c.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(c.end) | timestamp_custom('%H:%M') }} | {{ c.price | round(3) }} | {{ c.stored_kwh }} |
+  - {{ as_timestamp(c.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(c.end) | timestamp_custom('%H:%M') }} · €{{ c.price | round(2) }} · {{ c.stored_kwh | round(1) }} kWh
   {% endfor %}
-  | Use | Price | kWh |
-  |---|---|---|
+  **Use:**
   {% for x in d -%}
-  | {{ as_timestamp(x.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(x.end) | timestamp_custom('%H:%M') }} | {{ x.price | round(3) }} | {{ x.stored_kwh }} |
+  - {{ as_timestamp(x.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(x.end) | timestamp_custom('%H:%M') }} · €{{ x.price | round(2) }} · {{ x.stored_kwh | round(1) }} kWh
   {% endfor %}
   {% endif %}
   ---
-  ### Price spread
-  {% set fc = state_attr(price, 'forecast') or [] %}
-  {% set nowts = as_timestamp(now()) %}
-  {% set endts = as_timestamp(state_attr(dr, 'horizon_end')) if state_attr(dr, 'horizon_end') else nowts + 86400 %}
-  {% set ns = namespace(minp=none, minat='', lo=none, loat='', hi=none, hiat='', best=none, buy='', buyp=0, use='', usep=0) %}
-  {% for e in fc if as_timestamp(e.end_date) > nowts and as_timestamp(e.start_date) < endts %}
-  {% set pr = (e.price_tax_included.amount if e.price_tax_included is defined else e.electricity_price) / 10000000 %}
-  {% if ns.minp is not none %}
-  {% set net = rte * pr - ns.minp - wear %}
-  {% if ns.best is none or net > ns.best %}
-  {% set ns.best = net %}{% set ns.buy = ns.minat %}{% set ns.buyp = ns.minp %}{% set ns.use = e.start_date %}{% set ns.usep = pr %}
-  {% endif %}
-  {% endif %}
-  {% if ns.minp is none or pr < ns.minp %}{% set ns.minp = pr %}{% set ns.minat = e.start_date %}{% endif %}
-  {% if ns.lo is none or pr < ns.lo %}{% set ns.lo = pr %}{% set ns.loat = e.start_date %}{% endif %}
-  {% if ns.hi is none or pr > ns.hi %}{% set ns.hi = pr %}{% set ns.hiat = e.start_date %}{% endif %}
-  {% endfor %}
-  {% if ns.lo is none %}
-  No price forecast found on `{{ price }}`.
-  {% else %}
-  | Until next sunrise | When | Price |
-  |---|---|---|
-  | Cheapest | {{ as_timestamp(ns.loat) | timestamp_custom('%a %H:%M') }} | €{{ ns.lo | round(3) }} |
-  | Dearest | {{ as_timestamp(ns.hiat) | timestamp_custom('%a %H:%M') }} | €{{ ns.hi | round(3) }} |
-
-  {% if ns.best is not none and ns.usep > ns.buyp %}
-  **Best buy → use:** {{ as_timestamp(ns.buy) | timestamp_custom('%a %H:%M') }} at €{{ ns.buyp | round(3) }} → {{ as_timestamp(ns.use) | timestamp_custom('%a %H:%M') }} at €{{ ns.usep | round(3) }}. Gross spread €{{ (ns.usep - ns.buyp) | round(3) }}, **net €{{ ns.best | round(3) }} per kWh** after losses and wear. {{ '✅ clears' if ns.best >= margin else '❌ below' }} your margin of €{{ margin | round(3) }}.
-  {% else %}
-  **Best buy → use:** no dearer hour comes after a cheaper one.
-  {% endif %}
-  _A ✅ only means a trade would pay per kWh. Extra energy is bought only for dear demand that the battery plus the already planned charge do not cover._
-  To pay off when buying at the cheapest price (€{{ ns.lo | round(3) }}), the use price must be at least **€{{ ((ns.lo + wear + margin) / rte) | round(3) }}** (spread €{{ (((ns.lo + wear + margin) / rte) - ns.lo) | round(3) }}).
-  {% endif %}
-  ---
-  ### Discharge
-  **Now:** {{ status_texts.get(states(ist), states(ist)) }}
-
-  {% if state_attr(dr, 'reserve_kwh') | float(0) > 0 -%}
-  **Reserve:** holding {{ state_attr(dr, 'reserve_kwh') | float(0) | round(1) }} kWh ({{ state_attr(dr, 'reserve_soc_pct') | float(0) | round(0) }}% of the battery) for hours above €{{ state_attr(dr, 'threshold_price') | float(0) | round(2) }}
+  {%- set fc = state_attr(price, 'forecast') or [] %}
+  {%- set nowts = as_timestamp(now()) %}
+  {%- set endts = as_timestamp(state_attr(dr, 'horizon_end')) if state_attr(dr, 'horizon_end') else nowts + 86400 %}
+  {%- set ns = namespace(minp=none, lo=none, loat='', hi=none, hiat='', best=none, buyp=0, usep=0) %}
+  {%- for e in fc if as_timestamp(e.end_date) > nowts and as_timestamp(e.start_date) < endts %}
+  {%- set pr = (e.price_tax_included.amount if e.price_tax_included is defined else e.electricity_price) / 10000000 %}
+  {%- if ns.minp is not none %}
+  {%- set net = rte * pr - ns.minp - wear %}
+  {%- if ns.best is none or net > ns.best %}{% set ns.best = net %}{% set ns.buyp = ns.minp %}{% set ns.usep = pr %}{% endif %}
+  {%- endif %}
+  {%- if ns.minp is none or pr < ns.minp %}{% set ns.minp = pr %}{% endif %}
+  {%- if ns.lo is none or pr < ns.lo %}{% set ns.lo = pr %}{% set ns.loat = e.start_date %}{% endif %}
+  {%- if ns.hi is none or pr > ns.hi %}{% set ns.hi = pr %}{% set ns.hiat = e.start_date %}{% endif %}
+  {%- endfor %}
+  **Prices until sunrise:**
+  {% if ns.lo is none -%}
+  no forecast found on `{{ price }}`
   {%- else -%}
-  **Reserve:** not holding anything ({{ hold_texts.get(state_attr(dr, 'reason'), state_attr(dr, 'reason')) }})
+  cheapest €{{ ns.lo | round(2) }} ({{ as_timestamp(ns.loat) | timestamp_custom('%a %H:%M') }}) · dearest €{{ ns.hi | round(2) }} ({{ as_timestamp(ns.hiat) | timestamp_custom('%a %H:%M') }})
+  {%- if ns.best is not none and ns.usep > ns.buyp %}
+
+  Best trade: net **€{{ ns.best | round(2) }}/kWh** {{ '✅' if ns.best >= margin else '❌' }} (needs ≥ €{{ margin | round(2) }}). To pay off at the cheapest price, the dear hour must be ≥ €{{ ((ns.lo + wear + margin) / rte) | round(2) }}.
+  {%- else %}
+
+  No dear hour comes after a cheap one.
+  {%- endif -%}
   {%- endif %}
 
-  {% set sales = state_attr(hp, 'allocations') or [] %}
-  {% if sales %}
-  **High-Price Sale:** {{ sales | length }} sale period(s) planned, {{ state_attr(hp, 'total_allocated_kwh') | float(0) | round(1) }} kWh in total
+  **Discharge:**
+  - Now: {{ status_texts.get(states(ist), states(ist)) }}
+  - Reserve: {% if state_attr(dr, 'reserve_kwh') | float(0) > 0 %}holding {{ state_attr(dr, 'reserve_kwh') | float(0) | round(1) }} kWh for hours above €{{ state_attr(dr, 'threshold_price') | float(0) | round(2) }}{% else %}nothing held{% endif %}
+  {%- set sales = state_attr(hp, 'allocations') or [] %}
+  - Sale: {% if sales %}{{ state_attr(hp, 'total_allocated_kwh') | float(0) | round(1) }} kWh planned {{ as_timestamp((sales | first).start) | timestamp_custom('%H:%M') }}–{{ as_timestamp((sales | last).end) | timestamp_custom('%H:%M') }}{% else %}none planned{% endif %}
 
-  | Sell | Price | kWh | kW |
-  |---|---|---|---|
-  {% for s in sales -%}
-  | {{ as_timestamp(s.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(s.end) | timestamp_custom('%H:%M') }} | {{ s.export_price | round(3) }} | {{ s.energy_kwh | round(2) }} | {{ (s.power_w / 1000) | round(1) }} |
-  {% endfor %}
-  {% else %}
-  **High-Price Sale:** nothing planned ({{ state_attr(hp, 'plan_reason') or state_attr(hp, 'reason') or states(hp) }})
-  {% endif %}
-  _Updated {{ as_timestamp(state_attr(p, 'evaluation_time')) | timestamp_custom('%H:%M') if state_attr(p, 'evaluation_time') else '-' }}_
+  _{{ as_timestamp(state_attr(p, 'evaluation_time')) | timestamp_custom('%H:%M') if state_attr(p, 'evaluation_time') else '-' }}_
 ```
 
 Adjust the entity ids at the top of the card if yours differ. The built-in daily timeline does not draw arbitrage periods yet.
