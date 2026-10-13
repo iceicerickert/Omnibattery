@@ -55,6 +55,8 @@ content: |-
   {% set why = state_attr(pc, 'decision_reason') %}
   {% set usable = state_attr(dr, 'usable_energy_kwh') | float(0) %}
   {% set demand = state_attr(dr, 'horizon_demand_kwh') | float(0) %}
+  {% set need = demand / (rte ** 0.5) %}
+  {% set have = usable + committed %}
   {% set texts = {
     'no_unserved_demand': 'Nothing extra to buy. The battery plus the grid charge already planned cover everything the house needs in the hours that have prices.',
     'no_profitable_spread': 'Not worth it. The gap between cheap and dear hours is too small after round-trip losses, wear cost and margin.',
@@ -97,6 +99,9 @@ content: |-
   | Usable energy in battery (live) | {{ usable | round(1) }} kWh |
   | House demand in priced hours | {{ demand | round(1) }} kWh |
   | Grid charge already planned | {{ committed | round(1) }} kWh |
+  | **Needed from the battery** (demand after losses) | {{ need | round(1) }} kWh |
+  | **Available** (battery + planned charge) | {{ have | round(1) }} kWh |
+  | **Left over** | {{ '+' if have >= need else '' }}{{ (have - need) | round(1) }} kWh |
   {% endif %}
   {% if st != 'planned' and committed > 0 and why %}
   **Why charge is planned already:** {{ why }}
@@ -146,6 +151,7 @@ content: |-
   {% else %}
   **Best buy → use:** no dearer hour comes after a cheaper one.
   {% endif %}
+  _A ✅ only means a trade would pay per kWh. Extra energy is bought only for dear demand that the battery plus the already planned charge do not cover._
   To pay off when buying at the cheapest price (€{{ ns.lo | round(3) }}), the use price must be at least **€{{ ((ns.lo + wear + margin) / rte) | round(3) }}** (spread €{{ (((ns.lo + wear + margin) / rte) - ns.lo) | round(3) }}).
   {% endif %}
   ---
