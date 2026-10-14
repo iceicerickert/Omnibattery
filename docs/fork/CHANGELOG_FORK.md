@@ -18,13 +18,14 @@ Changes carried by this fork on top of upstream (ffunes/Omnibattery). Kept in it
 ### Known gaps / later
 
 - Household use is valued at the **import price**; exports at the export price curve. For 2027 (end of the salderingsregeling), point the export price sensor at a tax-excluded series; nothing else needs to change.
-- **Zonneplan bonus (upstream price layer):** it is applied to every hour, not only daytime, and only when an export price sensor is configured (without one the export curve is the plain import curve, by design and by an upstream test). Selling in the evening would therefore be overvalued if you configure an export sensor with the bonus on. Fix in `pricing/engine.py::_apply_zonneplan_export_bonus` (daylight only) before using that combination.
+- **Zonneplan export bonus is now daytime-only** (`pricing/engine.py::_apply_zonneplan_export_bonus`): the slot must lie entirely between sunrise and sunset (Home Assistant's sun data); without sun data there is no bonus. Upstream applied it to every hour. It still only applies when an export price sensor with the Zonneplan type is configured, as upstream intends.
 - Not in the OmniBattery panel (`marstek-panel.js`) and not drawn in the daily timeline (arbitrage slots are deliberately left out of that projection). Add both later.
 - Translations only for English and Dutch; other languages fall back to English.
+- `tests/test_consumption_tracker.py::test_exclude_dates_drops_the_day_and_blocks_its_rebuild` fails on upstream `main` too (its fixture date has aged out of a 35-day window).
 - Docs are English only.
 
 
 ### Files touched in shared code (where upstream merges may conflict)
 
-`__init__.py`, `pricing/engine.py`, `pricing/__init__.py`, `pricing/notifications.py`, `pricing/high_price_discharge.py`, `control/high_price_discharge.py`, `control/discharge_reserve.py`, `switch.py`, `number.py`, `sensor.py`, `diagnostics.py`, `const/integration_const.py`, `strings.json`, `translations/en.json`, `translations/nl.json`.
+`__init__.py`, `pricing/engine.py`, `pricing/__init__.py`, `pricing/notifications.py`, `pricing/high_price_discharge.py`, `tests/test_zonneplan_pricing.py` (one line), `control/high_price_discharge.py`, `control/discharge_reserve.py`, `switch.py`, `number.py`, `sensor.py`, `diagnostics.py`, `const/integration_const.py`, `strings.json`, `translations/en.json`, `translations/nl.json`.
 New files: `pricing/arbitrage.py`, `tests/test_arbitrage_planner.py`, `tests/test_arbitrage_charging.py`, `docs/fork/`.

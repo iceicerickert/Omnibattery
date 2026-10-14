@@ -959,6 +959,10 @@ class PricingManager:
             or not getattr(controller, "zonneplan_export_bonus_enabled", False)
         ):
             return slots
+        # The bonus is paid on daytime feed-in only. Evening and night exports
+        # earn the plain price, so applying it everywhere would overvalue exactly
+        # the dear evening hours a sale is planned for.
+        sun_cache: dict = {}
         return [
             slot._replace(
                 price=(
@@ -966,8 +970,47 @@ class PricingManager:
                     + ZONNEPLAN_EXPORT_BONUS_FIXED_EUR_PER_KWH
                 )
             )
+            if self._slot_is_daylight(slot, sun_cache)
+            else slot
             for slot in slots
         ]
+
+    def _slot_is_daylight(self, slot, cache: dict | None = None) -> bool:
+        """Return whether the whole slot lies between sunrise and sunset.
+
+        Both ends must be in daylight, so a slot that straddles sunrise or sunset
+        gets no bonus: the conservative side for a sale. Without usable sun data
+        (no location, polar day or night, an error) the answer is no.
+        """
+        from homeassistant.helpers import sun
+        from homeassistant.util import dt as dt_util
+
+        cache = {} if cache is None else cache
+
+        def aware(moment: datetime) -> datetime:
+            if moment.tzinfo is None:
+                return moment.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+            return moment
+
+        try:
+            start = aware(slot.start)
+            end = aware(slot.end) - timedelta(seconds=1)
+            for moment in (start, end):
+                day = moment.astimezone(dt_util.DEFAULT_TIME_ZONE).date()
+                if day not in cache:
+                    cache[day] = (
+                        sun.get_astral_event_date(self._hass, "sunrise", day),
+                        sun.get_astral_event_date(self._hass, "sunset", day),
+                    )
+                sunrise, sunset = cache[day]
+                if sunrise is None or sunset is None:
+                    return False
+                if not sunrise <= moment < sunset:
+                    return False
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Zonneplan export bonus: no sun data, bonus skipped: %s", err)
+            return False
+        return True
 
     def _parse_sensor_price_slots(
         self, entity_id: str, integration_type: str, *, quiet: bool = False

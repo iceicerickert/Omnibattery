@@ -70,6 +70,7 @@ content: |-
   {%- set usable = state_attr(dr, 'usable_energy_kwh') | float(0) %}
   {%- set need = state_attr(dr, 'horizon_demand_kwh') | float(0) / (rte ** 0.5) %}
   {%- set left = usable + committed - need %}
+  {%- set known = state_attr(dr, 'reason') != 'no_usable_energy' %}
   {%- set texts = {
     'no_unserved_demand': 'battery + planned charge already cover the demand' ~ ('' if state_attr(p, 'export_enabled') else ' (turn on selling to also trade the spread)'),
     'no_profitable_spread': 'price gap too small after losses, wear and margin',
@@ -100,8 +101,8 @@ content: |-
   |---|--:|
   | Battery, usable now | {{ usable | round(1) }} kWh |
   | + Planned grid charge{{ ' (' ~ cause ~ ')' if committed > 0 else '' }} | {{ committed | round(1) }} kWh |
-  | − House demand, after losses | {{ need | round(1) }} kWh |
-  | **= Left over** | **{{ '+' if left >= 0 else '' }}{{ left | round(1) }} kWh** |
+  | − House demand, after losses | {{ (need | round(1) ~ ' kWh') if known else 'n/a (battery empty)' }} |
+  | **= Left over** | **{{ ('+' if left >= 0 else '') ~ (left | round(1)) ~ ' kWh' if known else 'n/a' }}** |
   {% endif %}
   {%- set a = state_attr(p, 'charges') or [] %}
   {%- set d = state_attr(p, 'discharges') or [] %}

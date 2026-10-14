@@ -480,3 +480,92 @@ def test_reload_replans_when_selling_is_toggled_elsewhere():
     ChargeDischargeController.update_pd_parameters(controller)
     assert controller.arbitrage_export_enabled is True
     assert controller._schedule_arbitrage_reevaluation.called
+
+
+# ---------------------------------------------------------------------------
+# Zonneplan bonus: daytime only (price layer)
+# ---------------------------------------------------------------------------
+
+
+def _bonus_manager(monkeypatch, sunrise_h=8, sunset_h=19, *, sun_missing=False):
+    from zoneinfo import ZoneInfo
+
+    from homeassistant.helpers import sun
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.omnibattery.pricing.engine import PricingManager
+
+    tz = ZoneInfo("Europe/Amsterdam")
+    monkeypatch.setattr(dt_util, "DEFAULT_TIME_ZONE", tz)
+
+    def fake_event(hass, event, day):
+        if sun_missing:
+            return None
+        hour = sunrise_h if event == "sunrise" else sunset_h
+        return datetime(day.year, day.month, day.day, hour, tzinfo=tz)
+
+    monkeypatch.setattr(sun, "get_astral_event_date", fake_event)
+    controller = SimpleNamespace(zonneplan_export_bonus_enabled=True)
+    return PricingManager(SimpleNamespace(), controller)
+
+
+def _slots_at(*hours):
+    day = datetime(2026, 10, 14)
+    return [
+        PriceSlot(day + timedelta(hours=h), day + timedelta(hours=h, minutes=15), 0.50)
+        for h in hours
+    ]
+
+
+def test_the_bonus_applies_in_daylight_only(monkeypatch):
+    manager = _bonus_manager(monkeypatch)
+    day, evening, night = manager._apply_zonneplan_export_bonus(
+        _slots_at(12, 20, 3), "zonneplan"
+    )
+    assert day.price == pytest.approx(0.50 * 1.10 + 0.02)
+    assert evening.price == 0.50
+    assert night.price == 0.50
+
+
+def test_a_slot_touching_sunrise_or_sunset_gets_no_bonus(monkeypatch):
+    manager = _bonus_manager(monkeypatch)
+    before, first, last, after = manager._apply_zonneplan_export_bonus(
+        _slots_at(7.75, 8, 18.75, 19), "zonneplan"
+    )
+    assert before.price == 0.50          # ends exactly at sunrise: still dark
+    assert first.price > 0.50            # fully in daylight
+    assert last.price > 0.50             # 18:45-19:00 ends at sunset: daylight
+    assert after.price == 0.50           # starts at sunset
+
+
+def test_without_sun_data_there_is_no_bonus(monkeypatch):
+    manager = _bonus_manager(monkeypatch, sun_missing=True)
+    assert [s.price for s in manager._apply_zonneplan_export_bonus(_slots_at(12), "zonneplan")] == [0.50]
+
+
+def test_a_failing_sun_lookup_means_no_bonus_not_an_error(monkeypatch):
+    from homeassistant.helpers import sun
+
+    manager = _bonus_manager(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("no location")
+
+    monkeypatch.setattr(sun, "get_astral_event_date", boom)
+    assert [s.price for s in manager._apply_zonneplan_export_bonus(_slots_at(12), "zonneplan")] == [0.50]
+
+
+def test_other_providers_and_a_disabled_option_are_untouched(monkeypatch):
+    manager = _bonus_manager(monkeypatch)
+    assert [s.price for s in manager._apply_zonneplan_export_bonus(_slots_at(12), "nordpool")] == [0.50]
+    manager._controller.zonneplan_export_bonus_enabled = False
+    assert [s.price for s in manager._apply_zonneplan_export_bonus(_slots_at(12), "zonneplan")] == [0.50]
+
+
+def test_the_bonus_follows_the_season(monkeypatch):
+    summer = _bonus_manager(monkeypatch, sunrise_h=5, sunset_h=22)
+    prices = [s.price for s in summer._apply_zonneplan_export_bonus(_slots_at(6, 21), "zonneplan")]
+    assert all(p > 0.50 for p in prices)
+    winter = _bonus_manager(monkeypatch, sunrise_h=8, sunset_h=17)
+    prices = [s.price for s in winter._apply_zonneplan_export_bonus(_slots_at(6, 21), "zonneplan")]
+    assert prices == [0.50, 0.50]
