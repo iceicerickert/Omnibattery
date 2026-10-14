@@ -1419,6 +1419,12 @@
       "smart_predischarge": {
         "name": "Smart Pre-discharge / Anti-curtailment"
       },
+      "arbitrage_export": {
+        "name": "Sell extra arbitrage energy"
+      },
+      "arbitrage_charging": {
+        "name": "Price arbitrage charging"
+      },
       "negative_price_charging": {
         "name": "Negative-price opportunistic charging"
       },
@@ -1631,6 +1637,9 @@
           "skipped_full_charge_day": "Skipped – Full charge day",
           "charging_to_setpoint": "Charging to setpoint"
         }
+      },
+      "arbitrage_plan": {
+        "name": "Arbitrage Plan"
       },
       "high_price_discharge_status": {
         "name": "High-Price Sale Status",
@@ -2334,6 +2343,9 @@
       },
       "discharge_price_threshold": {
         "name": "Discharge Price Floor"
+      },
+      "arbitrage_wear_cost": {
+        "name": "Arbitrage wear cost"
       },
       "min_arbitrage_margin": {
         "name": "Minimum Arbitrage Margin"

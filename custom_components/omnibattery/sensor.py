@@ -225,6 +225,7 @@ async def async_setup_entry(
     # a permanently-idle diagnostic.
     if controller and controller.predictive_charging_mode == PREDICTIVE_MODE_DYNAMIC_PRICING:
         entities.append(HighPriceDischargeSensor(hass, entry, controller))
+        entities.append(ArbitragePlanSensor(hass, entry, controller))
 
     # Add weekly full charge status sensor (when weekly charge is enabled)
     if controller and controller.weekly_full_charge_enabled:
@@ -705,6 +706,58 @@ class HighPriceDischargeSensor(SensorEntity):
     @property
     def device_info(self):
         """Return device information for the system."""
+        return {
+            "identifiers": {(DOMAIN, "marstek_venus_system")},
+            "name": "Omnibattery System",
+            "manufacturer": "Omnibattery",
+            "model": "Multi-Battery System",
+        }
+
+
+class ArbitragePlanSensor(SensorEntity):
+    """The arbitrage plan: what it will buy, when, what it counts on, what it expects.
+
+    The state is the plan status. Everything a dashboard card needs (charge and
+    discharge slots with prices and kWh, expected gain, the reason nothing was
+    planned) is in the attributes, so one entity feeds the whole card.
+    """
+
+    _unrecorded_attributes = frozenset({"charges", "discharges"})
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, controller) -> None:
+        self.hass = hass
+        self.entry = entry
+        self._controller = controller
+
+        self._attr_has_entity_name = True
+        self._attr_translation_key = "arbitrage_plan"
+        self._attr_unique_id = f"{SYSTEM_UNIQUE_ID_PREFIX}arbitrage_plan"
+        self.entity_id = system_entity_id("sensor", "arbitrage_plan")
+        self._attr_icon = "mdi:swap-vertical-bold"
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
+        self._attr_should_poll = True
+
+    def _status(self) -> dict:
+        pricing = getattr(self._controller, "_pricing_mgr", None)
+        if pricing is None:
+            return {"status": "disabled"}
+        info = dict(pricing.arbitrage_status())
+        if not info.get("enabled"):
+            info["status"] = "disabled"
+        return info
+
+    @property
+    def native_value(self) -> str:
+        return str(self._status().get("status", "disabled"))
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        details = self._status()
+        details.pop("status", None)
+        return details
+
+    @property
+    def device_info(self):
         return {
             "identifiers": {(DOMAIN, "marstek_venus_system")},
             "name": "Omnibattery System",

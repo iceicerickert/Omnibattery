@@ -939,6 +939,20 @@ DEFAULT_PREDISCHARGE_RESERVE_SOC = 20.0
 CONF_NEGATIVE_PRICE_CHARGING_ENABLED = "negative_price_charging_enabled"
 DEFAULT_NEGATIVE_PRICE_CHARGING_ENABLED = False
 
+# Price arbitrage charging: buy extra energy in cheap slots, beyond the forecast
+# deficit, when the later demand it displaces is dear enough to repay the round
+# trip, the wear on the cells and CONF_MIN_ARBITRAGE_MARGIN.  The wear cost is
+# currency per grid kWh bought.  Dynamic pricing only, disabled by default.
+CONF_ARBITRAGE_CHARGING_ENABLED = "arbitrage_charging_enabled"
+DEFAULT_ARBITRAGE_CHARGING_ENABLED = False
+CONF_ARBITRAGE_WEAR_COST = "arbitrage_wear_cost"
+DEFAULT_ARBITRAGE_WEAR_COST = 0.0
+# Also buy extra energy to *sell* in the dear hours, not only to use at home. A
+# separate opt-in: it exports battery energy, which the other arbitrage mode
+# never does.
+CONF_ARBITRAGE_EXPORT_ENABLED = "arbitrage_export_enabled"
+DEFAULT_ARBITRAGE_EXPORT_ENABLED = False
+
 # Price-aware solar surplus absorption.  Storing surplus forfeits that slot's
 # feed-in revenue, so on a dynamic contract the same daily charge is cheaper
 # taken in the lowest-priced hours.  Dynamic pricing only, disabled by default.

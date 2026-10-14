@@ -232,6 +232,10 @@ class DischargeReserveManager:
         demand, surplus = self._demand_and_surplus_by_slot(
             pricing, slots, now, horizon_end
         )
+        # Energy arbitrage bought to sell is held for those hours like any other
+        # demand, or the house would use it before the sale.
+        for slot, kwh in self._arbitrage_export_by_slot(slots).items():
+            demand[slot] = float(demand.get(slot, 0.0) or 0.0) + kwh
         try:
             plan = plan_discharge_reserve(
                 slots,
@@ -379,6 +383,33 @@ class DischargeReserveManager:
             return bool(owner(coordinator))
         except Exception:  # noqa: BLE001
             return True
+
+    def _arbitrage_export_by_slot(self, slots) -> dict:
+        """Spread the planned arbitrage sales over the price slots they overlap."""
+        controller = self._controller
+        if not (
+            getattr(controller, "arbitrage_charging_enabled", False)
+            and getattr(controller, "arbitrage_export_enabled", False)
+        ):
+            return {}
+        schedule = getattr(controller, "_dynamic_pricing_schedule", None)
+        plan = getattr(schedule, "arbitrage_plan", None) or getattr(
+            controller, "_dp_last_arbitrage_plan", None
+        )
+        if plan is None or not getattr(plan, "planned", False):
+            return {}
+        held: dict = {}
+        for sale in plan.exports:
+            span = (sale.end - sale.start).total_seconds()
+            if span <= 0 or sale.delivered_kwh <= 0:
+                continue
+            for slot in slots:
+                overlap = (
+                    min(slot.end, sale.end) - max(slot.start, sale.start)
+                ).total_seconds()
+                if overlap > 0:
+                    held[slot] = held.get(slot, 0.0) + sale.delivered_kwh * overlap / span
+        return held
 
     def _demand_and_surplus_by_slot(
         self, pricing, slots, now: datetime, horizon_end

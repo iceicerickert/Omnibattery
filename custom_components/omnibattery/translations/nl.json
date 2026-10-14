@@ -1503,6 +1503,12 @@
       "smart_predischarge": {
         "name": "Slim voorontladen / anti-afregeling"
       },
+      "arbitrage_export": {
+        "name": "Extra arbitrage-energie verkopen"
+      },
+      "arbitrage_charging": {
+        "name": "Laden op prijsverschil (arbitrage)"
+      },
       "negative_price_charging": {
         "name": "Opportunistisch laden bij negatieve prijzen"
       },
@@ -1634,6 +1640,9 @@
           "skipped_full_charge_day": "Overgeslagen – Vollaaddag",
           "charging_to_setpoint": "Laden tot setpoint"
         }
+      },
+      "arbitrage_plan": {
+        "name": "Arbitrageplan"
       },
       "high_price_discharge_status": {
         "name": "Status Verkoop bij hoge prijs",
@@ -2343,6 +2352,9 @@
       },
       "discharge_price_threshold": {
         "name": "Ontlaad-prijsondergrens"
+      },
+      "arbitrage_wear_cost": {
+        "name": "Slijtagekosten arbitrage"
       },
       "min_arbitrage_margin": {
         "name": "Minimale arbitragemarge"

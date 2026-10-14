@@ -76,6 +76,7 @@ from ..tracking.consumption_profile import adjust_remaining_fallback_energy
 from . import (
     DynamicPricingSchedule,
     PriceSlot,
+    SLOT_PURPOSE_ARBITRAGE,
     SLOT_PURPOSE_COMBINED,
     SLOT_PURPOSE_DEFICIT,
     SLOT_PURPOSE_NEGATIVE_PRICE,
@@ -91,6 +92,15 @@ from .chronological import (
     build_energy_deadlines,
     evaluate_chronological_request,
     normalize_energy_shape,
+)
+from .arbitrage import (
+    MIN_ALLOCATION_KWH as ARBITRAGE_MIN_ALLOCATION_KWH,
+    REASON_NEEDS_DISCHARGE_HOLD,
+    REASON_NO_FLEET,
+    STATUS_NOTHING_PROFITABLE as ARBITRAGE_STATUS_NOTHING,
+    ArbitragePlan,
+    ArbitrageSlot,
+    plan_arbitrage,
 )
 from .solar_timeline import build_boundaries, build_solar_timeline
 from .curtailment import (
@@ -114,6 +124,10 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
+
+# How often arbitrage is re-planned on its own. A full rebuild re-notifies and can
+# reshuffle deficit charging, so this refresh only touches arbitrage slots.
+ARBITRAGE_REFRESH_INTERVAL = timedelta(hours=1)
 
 # A configured forecast may briefly be unavailable while its provider refreshes
 # around midnight.  This is a retry grace period, not a delay applied to every
@@ -945,6 +959,10 @@ class PricingManager:
             or not getattr(controller, "zonneplan_export_bonus_enabled", False)
         ):
             return slots
+        # The bonus is paid on daytime feed-in only. Evening and night exports
+        # earn the plain price, so applying it everywhere would overvalue exactly
+        # the dear evening hours a sale is planned for.
+        sun_cache: dict = {}
         return [
             slot._replace(
                 price=(
@@ -952,8 +970,47 @@ class PricingManager:
                     + ZONNEPLAN_EXPORT_BONUS_FIXED_EUR_PER_KWH
                 )
             )
+            if self._slot_is_daylight(slot, sun_cache)
+            else slot
             for slot in slots
         ]
+
+    def _slot_is_daylight(self, slot, cache: dict | None = None) -> bool:
+        """Return whether the whole slot lies between sunrise and sunset.
+
+        Both ends must be in daylight, so a slot that straddles sunrise or sunset
+        gets no bonus: the conservative side for a sale. Without usable sun data
+        (no location, polar day or night, an error) the answer is no.
+        """
+        from homeassistant.helpers import sun
+        from homeassistant.util import dt as dt_util
+
+        cache = {} if cache is None else cache
+
+        def aware(moment: datetime) -> datetime:
+            if moment.tzinfo is None:
+                return moment.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+            return moment
+
+        try:
+            start = aware(slot.start)
+            end = aware(slot.end) - timedelta(seconds=1)
+            for moment in (start, end):
+                day = moment.astimezone(dt_util.DEFAULT_TIME_ZONE).date()
+                if day not in cache:
+                    cache[day] = (
+                        sun.get_astral_event_date(self._hass, "sunrise", day),
+                        sun.get_astral_event_date(self._hass, "sunset", day),
+                    )
+                sunrise, sunset = cache[day]
+                if sunrise is None or sunset is None:
+                    return False
+                if not sunrise <= moment < sunset:
+                    return False
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Zonneplan export bonus: no sun data, bonus skipped: %s", err)
+            return False
+        return True
 
     def _parse_sensor_price_slots(
         self, entity_id: str, integration_type: str, *, quiet: bool = False
@@ -1168,6 +1225,12 @@ class PricingManager:
     def _schedule_type_from_purposes(purposes) -> str:
         """Summarise typed slots as deficit, negative_price or combined."""
         values = set(purposes)
+        if SLOT_PURPOSE_ARBITRAGE in values:
+            return (
+                SLOT_PURPOSE_ARBITRAGE
+                if values == {SLOT_PURPOSE_ARBITRAGE}
+                else SLOT_PURPOSE_COMBINED
+            )
         if SLOT_PURPOSE_COMBINED in values or {
             SLOT_PURPOSE_DEFICIT,
             SLOT_PURPOSE_NEGATIVE_PRICE,
@@ -1374,6 +1437,13 @@ class PricingManager:
             if purpose is None:
                 return None
 
+        if purpose == SLOT_PURPOSE_ARBITRAGE:
+            return (
+                SLOT_PURPOSE_ARBITRAGE
+                if self._arbitrage_slot_authorised(slot)
+                else None
+            )
+
         has_deficit = purpose in {SLOT_PURPOSE_DEFICIT, SLOT_PURPOSE_COMBINED}
         has_opportunity = purpose in {
             SLOT_PURPOSE_NEGATIVE_PRICE,
@@ -1439,7 +1509,9 @@ class PricingManager:
         schedule.negative_price_charging_needed = False
         schedule.negative_price_hours_needed = 0.0
         schedule.negative_price_energy_kwh = 0.0
-        schedule.charging_needed = deficit_needed
+        schedule.charging_needed = deficit_needed or (
+            SLOT_PURPOSE_ARBITRAGE in purposes.values()
+        )
         schedule.schedule_type = self._schedule_type_from_purposes(purposes.values())
         schedule.hours_needed = sum(
             max(0.0, (slot.end - slot.start).total_seconds() / 3600.0)
@@ -1459,6 +1531,611 @@ class PricingManager:
             )
         if not keep:
             self._controller._dynamic_pricing_schedule = None
+
+    # =========================================================================
+    # PRICE ARBITRAGE CHARGING
+    # =========================================================================
+
+    def _arbitrage_feature_enabled(self) -> bool:
+        """Return the complete scope gate for arbitrage charging."""
+        controller = self._controller
+        return bool(
+            getattr(controller, "arbitrage_charging_enabled", False)
+            and getattr(controller, "predictive_charging_enabled", False)
+            and getattr(controller, "predictive_charging_mode", None)
+            == PREDICTIVE_MODE_DYNAMIC_PRICING
+        )
+
+    def _arbitrage_export_enabled(self) -> bool:
+        """Return whether extra energy may also be bought to be sold."""
+        return bool(
+            self._arbitrage_feature_enabled()
+            and getattr(self._controller, "arbitrage_export_enabled", False)
+        )
+
+    def _arbitrage_export_prices(self, horizon: list, horizon_end: datetime) -> dict:
+        """Map each price slot to what exporting in it pays, never above the curve.
+
+        The export curve is the price layer's: it already carries tax, netting
+        and any bonus. Where its slots do not line up with the import slots the
+        lowest overlapping price is taken, so a sale is never planned on an
+        averaged-away spike. A slot with no export price is simply not sold in.
+        """
+        if not self._arbitrage_export_enabled():
+            return {}
+        try:
+            export_slots = self.get_future_export_price_slots(horizon_end=horizon_end)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Arbitrage: export prices unavailable, no sale planned: %s", err)
+            return {}
+        prices: dict = {}
+        for slot in horizon:
+            overlapping = [
+                float(other.price)
+                for other in export_slots
+                if other.start < slot.end
+                and slot.start < other.end
+                and other.price is not None
+                and math.isfinite(float(other.price))
+            ]
+            if overlapping:
+                prices[slot] = min(overlapping)
+        return prices
+
+    def _arbitrage_discharge_hold_active(self) -> bool:
+        """Return whether something stops the house burning bought energy early.
+
+        Energy bought at 03:00 for a 19:00 peak is worth nothing if the house
+        drains it at 07:00. Either the discharge reserve (holds energy for dearer
+        hours ahead) or the price-based discharge gate keeps it for the peak.
+        With neither, the plan would be a bet that nothing enforces.
+        """
+        controller = self._controller
+        return bool(
+            getattr(controller, "discharge_reserve_enabled", False)
+            or getattr(controller, "price_discharge_control", False)
+        )
+
+    def _arbitrage_fleet_energy(self) -> tuple[float, float] | None:
+        """Return ``(usable_kwh, free_kwh)`` for the batteries that may take part.
+
+        Usable is what sits above each battery's discharge floor; free is the room
+        up to its charge ceiling. Unreadable batteries are skipped, and no readable
+        battery returns None so the caller plans nothing rather than guessing.
+        """
+        usable = 0.0
+        free = 0.0
+        readable = False
+        ceiling_fn = getattr(self._controller, "_charge_ceiling_soc", None)
+        for coordinator in getattr(self._controller, "coordinators", []):
+            if not self._opportunistic_battery_eligible(coordinator):
+                continue
+            data = getattr(coordinator, "data", None) or {}
+            try:
+                soc = float(data.get("battery_soc"))
+                capacity = float(data.get("battery_total_energy"))
+                floor = float(coordinator.min_soc)
+                ceiling = float(
+                    ceiling_fn(coordinator) if callable(ceiling_fn) else coordinator.max_soc
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if not all(math.isfinite(v) for v in (soc, capacity, floor, ceiling)):
+                continue
+            if capacity <= 0:
+                continue
+            readable = True
+            usable += max(0.0, capacity * (soc - floor) / 100.0)
+            free += max(0.0, capacity * (ceiling - soc) / 100.0)
+        return (usable, free) if readable else None
+
+    def _arbitrage_sale_reserve(self) -> tuple[float, float]:
+        """Return ``(floor_kwh, margin_kwh)`` a planned sale has to leave behind.
+
+        The sale planner counts usable energy above the highest of the minimum
+        SOC, the guaranteed minimum SOC and the pre-discharge reserve, and keeps
+        a safety margin. ``floor_kwh`` is the part of that floor above the
+        household's own minimum, in battery kWh.
+        """
+        controller = self._controller
+        guaranteed = (
+            float(getattr(controller, "_predictive_min_soc_floor", 0.0) or 0.0)
+            if getattr(controller, "_predictive_min_soc_floor_enabled", False)
+            else 0.0
+        )
+        reserve = max(0.0, float(getattr(controller, "predischarge_reserve_soc", 0.0) or 0.0))
+        floor_kwh = 0.0
+        for coordinator in getattr(controller, "coordinators", []):
+            if not self._opportunistic_battery_eligible(coordinator):
+                continue
+            data = getattr(coordinator, "data", None) or {}
+            try:
+                capacity = float(data.get("battery_total_energy"))
+                minimum = float(coordinator.min_soc)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if not (math.isfinite(capacity) and math.isfinite(minimum)) or capacity <= 0:
+                continue
+            floor_pct = max(minimum, guaranteed, reserve)
+            floor_kwh += max(0.0, floor_pct - minimum) / 100.0 * capacity
+        try:
+            margin_kwh = max(
+                0.0, float(getattr(controller, "_predictive_safety_margin_kwh", 0.0) or 0.0)
+            )
+        except (TypeError, ValueError):
+            margin_kwh = 0.0
+        return floor_kwh, margin_kwh
+
+    def _arbitrage_slot_authorised(self, slot: PriceSlot) -> bool:
+        """Return whether an arbitrage slot may still charge at this instant."""
+        if not self._arbitrage_feature_enabled():
+            return False
+        if not self._arbitrage_discharge_hold_active():
+            return False
+        schedule = getattr(self._controller, "_dynamic_pricing_schedule", None)
+        planned = (
+            getattr(schedule, "slot_arbitrage_kwh", {}).get(slot, 0.0)
+            if schedule is not None
+            else 0.0
+        )
+        if not planned or planned < ARBITRAGE_MIN_ALLOCATION_KWH:
+            return False
+        # Something has to be left to fill. A full battery is not an error, it
+        # just means the sun (or an earlier slot) did the job.
+        compute = getattr(self._controller, "_compute_arbitrage_target_soc", None)
+        if not callable(compute):
+            # No way to tell how much is left to buy: buy nothing.
+            return False
+        targets = compute(slot)
+        for coordinator, target in (targets or {}).items():
+            data = getattr(coordinator, "data", None) or {}
+            try:
+                if float(data.get("battery_soc", 0.0) or 0.0) < float(target) - 1e-6:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _build_arbitrage_plan(
+        self,
+        slots: list,
+        now: datetime,
+        horizon_end: datetime,
+        *,
+        taken: set,
+        committed_kwh: float,
+    ) -> ArbitragePlan:
+        """Plan extra energy for the horizon; never raises, never returns None.
+
+        ``taken`` holds the slots another purpose already owns. They are not
+        offered for arbitrage, so a slot never carries two reasons at once.
+        """
+        controller = self._controller
+        if not self._arbitrage_discharge_hold_active():
+            return ArbitragePlan(
+                status=ARBITRAGE_STATUS_NOTHING,
+                reason=REASON_NEEDS_DISCHARGE_HOLD,
+                evaluation_time=now,
+            )
+        fleet = self._arbitrage_fleet_energy()
+        if fleet is None:
+            return ArbitragePlan(
+                status=ARBITRAGE_STATUS_NOTHING,
+                reason=REASON_NO_FLEET,
+                evaluation_time=now,
+            )
+        usable, free = fleet
+        horizon = [slot for slot in slots if slot.start < horizon_end and slot.end > now]
+        try:
+            demand, surplus = controller._discharge_reserve_mgr._demand_and_surplus_by_slot(
+                self, horizon, now, horizon_end
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Arbitrage: demand forecast failed, planning nothing: %s", err)
+            demand, surplus = {}, {}
+        ceiling = controller.max_price_threshold
+        export_prices = self._arbitrage_export_prices(horizon, horizon_end)
+        refill_slots: list = []
+        if self._arbitrage_export_enabled():
+            # The whole published curve, past the horizon: stored energy that is
+            # sold now is bought back at the cheapest hours still to come.
+            try:
+                published = self.get_future_price_slots(horizon_end=now + timedelta(days=3))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Arbitrage: refill prices unavailable: %s", err)
+                published = []
+            refill_slots = [
+                ArbitrageSlot(start=slot.start, end=slot.end, price=slot.price)
+                for slot in published
+                if slot.end > now and math.isfinite(float(slot.price))
+            ]
+        planner_slots = [
+            ArbitrageSlot(
+                start=slot.start,
+                end=slot.end,
+                price=slot.price,
+                net_demand_kwh=demand.get(slot, 0.0),
+                expected_surplus_kwh=surplus.get(slot, 0.0),
+                chargeable=slot not in taken,
+                ref=slot,
+                export_price=export_prices.get(slot),
+            )
+            for slot in horizon
+        ]
+        try:
+            margin = float(controller.min_arbitrage_margin or 0.0)
+            wear = float(getattr(controller, "arbitrage_wear_cost", 0.0) or 0.0)
+            efficiency = float(controller.round_trip_efficiency)
+        except (TypeError, ValueError):
+            margin, wear, efficiency = 0.0, 0.0, float("nan")
+        charge_kw = (
+            min(
+                self._contracted_charge_ceiling(),
+                max(0.0, float(controller.max_charge_capacity or 0.0)),
+            )
+            / 1000.0
+        )
+        discharge_kw = max(0.0, float(controller.max_discharge_capacity or 0.0)) / 1000.0
+        sale_floor_kwh, sale_margin_kwh = self._arbitrage_sale_reserve()
+        return plan_arbitrage(
+            planner_slots,
+            now=now,
+            usable_energy_kwh=usable,
+            free_space_kwh=free,
+            committed_charge_kwh=committed_kwh,
+            charge_power_kw=charge_kw,
+            discharge_power_kw=discharge_kw,
+            round_trip_efficiency=efficiency,
+            wear_cost=wear,
+            min_margin=margin,
+            max_charge_price=ceiling,
+            allow_export=self._arbitrage_export_enabled(),
+            refill_slots=refill_slots,
+            export_floor_kwh=sale_floor_kwh,
+            export_margin_kwh=sale_margin_kwh,
+            follow_sale_rule=True,
+        )
+
+    def _arbitrage_committed_kwh(self, schedule, now: datetime) -> float:
+        """Battery energy the deficit slots still ahead are going to deliver."""
+        if schedule is None or not getattr(schedule, "deficit_charging_needed", False):
+            return 0.0
+        future_deficit = [
+            slot
+            for slot in schedule.selected_slots
+            if slot.end > now
+            and schedule.purpose_for(slot) in {SLOT_PURPOSE_DEFICIT, SLOT_PURPOSE_COMBINED}
+        ]
+        if not future_deficit:
+            return 0.0
+        targets = getattr(schedule, "slot_energy_targets_kwh", {})
+        if targets:
+            return sum(float(targets.get(slot, 0.0) or 0.0) for slot in future_deficit)
+        decision = getattr(self._controller, "_last_decision_data", None) or {}
+        return float(decision.get("planned_grid_charge_kwh", 0.0) or 0.0)
+
+    def _arbitrage_refresh_due(self, now: datetime) -> bool:
+        """Return whether the hourly arbitrage-only refresh should run now."""
+        controller = self._controller
+        if not self._arbitrage_feature_enabled():
+            return False
+        if getattr(controller, "predictive_charging_overridden", False):
+            return False
+        # Nothing to refresh against until today's plan exists, and a running
+        # charge is left alone until it ends.
+        if getattr(controller, "_dynamic_pricing_evaluated_date", None) is None:
+            return False
+        if getattr(controller, "_current_price_slot_active", False):
+            return False
+        last = getattr(controller, "_dp_arbitrage_refreshed_at", None)
+        return last is None or now - last >= ARBITRAGE_REFRESH_INTERVAL
+
+    def _refresh_arbitrage_plan(self, now: datetime) -> None:
+        """Re-plan arbitrage only, leaving every other slot of the schedule alone.
+
+        The full rebuilds run on events (midnight, new prices, a SOC drop, a
+        forecast revision). Between them the battery, the sun and the house keep
+        moving, so arbitrage looks again every hour: it adds slots that became
+        worthwhile and withdraws future ones that no longer are. A slot already
+        running or started is never touched.
+        """
+        controller = self._controller
+        controller._dp_arbitrage_refreshed_at = now
+        horizon_end = self.energy_horizon_end(now)
+        slots = self.get_future_price_slots(horizon_end=horizon_end)
+        if not slots:
+            return
+        schedule = getattr(controller, "_dynamic_pricing_schedule", None)
+        owned = (
+            {
+                slot
+                for slot in schedule.selected_slots
+                if schedule.purpose_for(slot) != SLOT_PURPOSE_ARBITRAGE
+            }
+            if schedule is not None
+            else set()
+        )
+        plan = self._build_arbitrage_plan(
+            slots,
+            now,
+            horizon_end,
+            taken=owned,
+            committed_kwh=self._arbitrage_committed_kwh(schedule, now),
+        )
+        controller._dp_last_arbitrage_plan = plan
+        wanted: dict[PriceSlot, float] = {}
+        if plan.planned:
+            for charge in plan.charges:
+                slot = charge.ref
+                if slot in owned or self._slot_overlaps_curtailment_risk(slot):
+                    continue
+                wanted[slot] = charge.stored_kwh
+        self._apply_arbitrage_slots(plan, wanted, now, slots)
+
+    def _apply_arbitrage_slots(
+        self,
+        plan: ArbitragePlan,
+        wanted: dict,
+        now: datetime,
+        price_slots: list,
+    ) -> None:
+        """Swap the schedule's future arbitrage slots for ``wanted``, if they differ."""
+        controller = self._controller
+        schedule = getattr(controller, "_dynamic_pricing_schedule", None)
+        current = (
+            {
+                slot: float(schedule.slot_arbitrage_kwh.get(slot, 0.0))
+                for slot in schedule.selected_slots
+                if schedule.purpose_for(slot) == SLOT_PURPOSE_ARBITRAGE
+                and slot.start > now
+            }
+            if schedule is not None
+            else {}
+        )
+        unchanged = set(current) == set(wanted) and all(
+            abs(current[slot] - wanted[slot]) < 0.05 for slot in wanted
+        )
+        if unchanged:
+            if schedule is not None:
+                schedule.arbitrage_plan = plan
+            return
+
+        pre_purposes = getattr(controller, "_dp_pre_evaluated_purposes", {})
+        pre_slots = getattr(controller, "_dp_pre_evaluated_slots", {})
+        for slot in set(current) | set(wanted):
+            pre_purposes.pop(slot.start, None)
+            pre_slots.pop(slot.start, None)
+
+        if schedule is None:
+            if not wanted:
+                return
+            schedule = DynamicPricingSchedule(
+                hours_needed=0.0,
+                selected_slots=[],
+                average_price=0.0,
+                estimated_cost=0.0,
+                total_available_slots=len(price_slots),
+                evaluation_time=now,
+                energy_deficit_kwh=0.0,
+                charging_needed=True,
+                deficit_charging_needed=False,
+            )
+            schedule.slot_purposes = {}
+            controller._dynamic_pricing_schedule = schedule
+
+        kept = [
+            slot
+            for slot in schedule.selected_slots
+            if not (slot in current)
+        ]
+        purposes = {slot: schedule.purpose_for(slot) for slot in kept}
+        energy = {
+            slot: kwh
+            for slot, kwh in schedule.slot_arbitrage_kwh.items()
+            if slot in purposes
+        }
+        for slot, kwh in wanted.items():
+            kept.append(slot)
+            purposes[slot] = SLOT_PURPOSE_ARBITRAGE
+            energy[slot] = kwh
+        kept.sort(key=lambda slot: slot.start)
+        if not kept:
+            controller._dynamic_pricing_schedule = None
+            return
+
+        power_kw = min(
+            self._contracted_charge_ceiling(),
+            max(0.0, float(getattr(controller, "max_charge_capacity", 0.0) or 0.0)),
+        ) / 1000.0
+        arbitrage_cost = sum(
+            charge.grid_kwh * charge.price
+            for charge in plan.charges
+            if charge.ref in wanted
+        )
+        schedule.selected_slots = kept
+        schedule.slot_purposes = purposes
+        schedule.slot_arbitrage_kwh = energy
+        schedule.arbitrage_plan = plan
+        schedule.arbitrage_charging_needed = any(
+            purposes[slot] == SLOT_PURPOSE_ARBITRAGE for slot in kept
+        )
+        schedule.arbitrage_energy_kwh = sum(
+            kwh for slot, kwh in energy.items() if purposes.get(slot) == SLOT_PURPOSE_ARBITRAGE
+        )
+        schedule.charging_needed = bool(
+            getattr(schedule, "deficit_charging_needed", False)
+            or getattr(schedule, "negative_price_charging_needed", False)
+            or schedule.arbitrage_charging_needed
+        )
+        schedule.schedule_type = self._schedule_type_from_purposes(purposes.values())
+        schedule.hours_needed = sum(
+            max(0.0, (slot.end - slot.start).total_seconds() / 3600.0) for slot in kept
+        )
+        schedule.average_price = sum(slot.price for slot in kept) / len(kept)
+        schedule.estimated_cost = arbitrage_cost + sum(
+            slot.price * power_kw * max(0.0, (slot.end - slot.start).total_seconds() / 3600.0)
+            for slot in kept
+            if purposes[slot] != SLOT_PURPOSE_ARBITRAGE
+        )
+        _LOGGER.info(
+            "Dynamic pricing: arbitrage refreshed — %d slot(s), %.2f kWh, expected gain %.3f",
+            len(wanted),
+            sum(wanted.values()),
+            plan.expected_gain,
+        )
+
+    def _reevaluate_arbitrage_slot(self, next_slot: PriceSlot, now: datetime) -> None:
+        """Re-plan an hour ahead; keep the slot only if the plan still wants it.
+
+        The sun, the weather and the house all move after the morning plan. The
+        slot is sized again from the live battery and the live remainder of the
+        horizon, with deficit slots still ahead counted as committed.
+        """
+        controller = self._controller
+        schedule = controller._dynamic_pricing_schedule
+        purposes = getattr(controller, "_dp_pre_evaluated_purposes", None)
+        if purposes is None:
+            purposes = controller._dp_pre_evaluated_purposes = {}
+
+        kwh = 0.0
+        plan = None
+        if self._arbitrage_feature_enabled():
+            horizon_end = self.energy_horizon_end(now)
+            slots = self.get_future_price_slots(horizon_end=horizon_end)
+            owned = {
+                slot
+                for slot in schedule.selected_slots
+                if schedule.purpose_for(slot) != SLOT_PURPOSE_ARBITRAGE
+            }
+            committed = self._arbitrage_committed_kwh(schedule, now)
+            plan = self._build_arbitrage_plan(
+                slots, now, horizon_end, taken=owned, committed_kwh=committed
+            )
+            kwh = plan.stored_kwh_for(next_slot) if plan.planned else 0.0
+
+        if plan is not None:
+            schedule.arbitrage_plan = plan
+        if kwh >= ARBITRAGE_MIN_ALLOCATION_KWH:
+            schedule.slot_arbitrage_kwh[next_slot] = kwh
+            purposes[next_slot.start] = SLOT_PURPOSE_ARBITRAGE
+            controller._dp_pre_evaluated_slots[next_slot.start] = True
+            _LOGGER.info(
+                "Dynamic pricing: arbitrage slot %s re-planned to %.2f kWh",
+                next_slot.start.strftime("%H:%M"),
+                kwh,
+            )
+        else:
+            purposes[next_slot.start] = None
+            controller._dp_pre_evaluated_slots[next_slot.start] = False
+            _LOGGER.info(
+                "Dynamic pricing: arbitrage slot %s no longer worth it, skipping",
+                next_slot.start.strftime("%H:%M"),
+            )
+
+    def clear_arbitrage_runtime(self, reason: str = "cleanup") -> None:
+        """Withdraw every arbitrage slot; deficit and negative-price slots stay."""
+        controller = self._controller
+        schedule = getattr(controller, "_dynamic_pricing_schedule", None)
+        if schedule is not None and hasattr(schedule, "slot_purposes"):
+            keep = [
+                slot
+                for slot in schedule.selected_slots
+                if schedule.purpose_for(slot) != SLOT_PURPOSE_ARBITRAGE
+            ]
+            if len(keep) != len(schedule.selected_slots):
+                purposes = {slot: schedule.purpose_for(slot) for slot in keep}
+                deficit_needed = bool(getattr(schedule, "deficit_charging_needed", False))
+                opportunity_needed = bool(
+                    getattr(schedule, "negative_price_charging_needed", False)
+                )
+                schedule.selected_slots = keep
+                schedule.slot_purposes = purposes
+                schedule.slot_arbitrage_kwh = {}
+                schedule.arbitrage_charging_needed = False
+                schedule.arbitrage_energy_kwh = 0.0
+                schedule.arbitrage_plan = None
+                schedule.charging_needed = deficit_needed or opportunity_needed
+                if purposes:
+                    schedule.schedule_type = self._schedule_type_from_purposes(
+                        purposes.values()
+                    )
+                schedule.hours_needed = sum(
+                    max(0.0, (slot.end - slot.start).total_seconds() / 3600.0)
+                    for slot in keep
+                )
+                if not keep:
+                    controller._dynamic_pricing_schedule = None
+        if getattr(controller, "_active_dynamic_slot_purpose", None) == SLOT_PURPOSE_ARBITRAGE:
+            controller.grid_charging_active = False
+            controller._current_price_slot_active = False
+            controller._grid_charging_initialized = False
+            controller._predictive_charge_suspended_for_demand = False
+            controller._active_dynamic_slot_purpose = None
+            controller._active_dynamic_price_slot = None
+            controller._predictive_charge_target_soc = None
+            controller.previous_power = 0
+            controller.previous_error = 0
+        pre = getattr(controller, "_dp_pre_evaluated_purposes", None)
+        if pre:
+            for start, purpose in list(pre.items()):
+                if purpose == SLOT_PURPOSE_ARBITRAGE:
+                    pre.pop(start, None)
+        _LOGGER.debug("Arbitrage charging runtime cleared: %s", reason)
+
+    def arbitrage_status(self) -> dict:
+        """Describe the current arbitrage plan for sensors, diagnostics and cards."""
+        controller = self._controller
+        schedule = getattr(controller, "_dynamic_pricing_schedule", None)
+        plan = getattr(schedule, "arbitrage_plan", None) if schedule else None
+        if plan is None:
+            plan = getattr(controller, "_dp_last_arbitrage_plan", None)
+        enabled = self._arbitrage_feature_enabled()
+        info: dict = {
+            "enabled": bool(getattr(controller, "arbitrage_charging_enabled", False)),
+            "active": bool(enabled),
+            "discharge_hold_active": self._arbitrage_discharge_hold_active(),
+            "export_enabled": bool(getattr(controller, "arbitrage_export_enabled", False)),
+            "wear_cost": getattr(controller, "arbitrage_wear_cost", 0.0),
+        }
+        if plan is None:
+            info.update(status="no_plan", reason=None, charges=[], discharges=[], export_kwh=0.0)
+            return info
+        slot_kwh = getattr(schedule, "slot_arbitrage_kwh", {}) if schedule else {}
+        info.update(
+            status=plan.status,
+            reason=plan.reason,
+            evaluation_time=plan.evaluation_time.isoformat() if plan.evaluation_time else None,
+            total_stored_kwh=round(plan.total_stored_kwh, 3),
+            total_grid_kwh=round(plan.total_grid_kwh, 3),
+            expected_gain=round(plan.expected_gain, 4),
+            average_charge_price=plan.average_charge_price,
+            average_value_price=plan.average_value_price,
+            unserved_demand_kwh=round(plan.unserved_demand_kwh, 3),
+            committed_charge_kwh=round(plan.committed_charge_kwh, 3),
+            charges=[
+                {
+                    "start": charge.start.isoformat(),
+                    "end": charge.end.isoformat(),
+                    "price": charge.price,
+                    "stored_kwh": round(slot_kwh.get(charge.ref, charge.stored_kwh), 3),
+                    "grid_kwh": round(charge.grid_kwh, 3),
+                }
+                for charge in plan.charges
+            ],
+            discharges=[
+                {
+                    "start": discharge.start.isoformat(),
+                    "end": discharge.end.isoformat(),
+                    "price": discharge.price,
+                    "stored_kwh": round(discharge.stored_kwh, 3),
+                    "delivered_kwh": round(discharge.delivered_kwh, 3),
+                    "kind": discharge.kind,
+                }
+                for discharge in plan.discharges
+            ],
+            export_kwh=round(sum(d.delivered_kwh for d in plan.exports), 3),
+        )
+        return info
 
     def clear_negative_price_runtime(self, reason: str = "cleanup") -> None:
         """Clear transient opportunity state without disturbing deficit charging."""
@@ -3582,6 +4259,48 @@ class PricingManager:
                     weekly_reserve_not_before,
                 )
 
+        # Price arbitrage: extra energy for later, dearer demand. Slots another
+        # purpose owns are never offered, so an arbitrage slot has one reason.
+        arbitrage_plan: ArbitragePlan | None = None
+        arbitrage_selected: list[PriceSlot] = []
+        slot_arbitrage_kwh: dict[PriceSlot, float] = {}
+        self._controller._dp_last_arbitrage_plan = None
+        if self._arbitrage_feature_enabled():
+            self._controller._dp_arbitrage_refreshed_at = eval_now
+            owned_slots = set(negative_price_selected)
+            committed_kwh = 0.0
+            if deficit_charging_needed:
+                owned_slots |= set(deficit_selected)
+                committed_kwh = (
+                    float(chronological_plan.total_required_kwh)
+                    if chronological_plan is not None
+                    else float(decision_data.get("planned_grid_charge_kwh", deficit_kwh) or 0.0)
+                )
+            arbitrage_plan = self._build_arbitrage_plan(
+                slots,
+                eval_now,
+                horizon_end,
+                taken=owned_slots,
+                committed_kwh=committed_kwh,
+            )
+            self._controller._dp_last_arbitrage_plan = arbitrage_plan
+            if arbitrage_plan.planned:
+                arbitrage_selected = [charge.ref for charge in arbitrage_plan.charges]
+                slot_arbitrage_kwh = {
+                    charge.ref: charge.stored_kwh for charge in arbitrage_plan.charges
+                }
+                if not deficit_charging_needed:
+                    # The legacy cheap-hour calendar is informational; leaving
+                    # it in would label arbitrage slots as a combined schedule.
+                    deficit_selected = []
+            _LOGGER.info(
+                "Dynamic pricing: arbitrage %s (%s), %.2f kWh stored, expected gain %.3f",
+                arbitrage_plan.status,
+                arbitrage_plan.reason,
+                arbitrage_plan.total_stored_kwh,
+                arbitrage_plan.expected_gain,
+            )
+
         def _combine_selected() -> tuple[list[PriceSlot], dict[PriceSlot, str]]:
             purposes: dict[PriceSlot, str] = {}
             for slot in deficit_selected:
@@ -3592,6 +4311,11 @@ class PricingManager:
                 purposes[slot] = self._merge_slot_purpose(
                     purposes.get(slot), SLOT_PURPOSE_NEGATIVE_PRICE
                 )
+            for slot in arbitrage_selected:
+                # A relocated deficit slot may land on an arbitrage slot. The
+                # deficit is a need and arbitrage a bet, so the need keeps it.
+                if slot not in purposes:
+                    purposes[slot] = SLOT_PURPOSE_ARBITRAGE
             return sorted(purposes, key=lambda slot: slot.start), purposes
 
         selected, slot_purposes = _combine_selected()
@@ -3675,12 +4399,16 @@ class PricingManager:
                         deficit_selected = [
                             allocation.slot for allocation in chronological_plan.allocations
                         ]
-            elif not deficit_charging_needed and opportunity_selected:
+            elif not deficit_charging_needed and (
+                opportunity_selected or arbitrage_selected
+            ):
                 # The legacy no-deficit calendar is informational only.  Do not
                 # resurrect it while relocating a real opportunity, or the safe
                 # negative slot would be mislabeled ``combined`` and gain a
                 # fictitious deficit purpose.
                 deficit_selected = []
+            # Arbitrage is optional, so it gives way to a protected solar window.
+            arbitrage_selected = [slot for slot in arbitrage_selected if _safe(slot)]
             selected, slot_purposes = _combine_selected()
             if len(selected) != old_selected_count:
                 _LOGGER.info(
@@ -3713,14 +4441,31 @@ class PricingManager:
             max(0.0, (slot.end - slot.start).total_seconds() / 3600.0)
             for slot in selected
         )
-        estimated_cost = sum(
+        planned_arbitrage_kwh = {
+            slot: kwh
+            for slot, kwh in slot_arbitrage_kwh.items()
+            if slot_purposes.get(slot) == SLOT_PURPOSE_ARBITRAGE
+        }
+        arbitrage_grid_cost = (
+            sum(
+                charge.grid_kwh * charge.price
+                for charge in arbitrage_plan.charges
+                if charge.ref in planned_arbitrage_kwh
+            )
+            if arbitrage_plan is not None
+            else 0.0
+        )
+        estimated_cost = arbitrage_grid_cost + sum(
             slot.price
             * effective_power_kw
             * max(0.0, (slot.end - slot.start).total_seconds() / 3600.0)
             for slot in selected
+            if slot not in planned_arbitrage_kwh
         )
         opportunity_selected = bool(negative_price_selected)
-        charging_needed = deficit_charging_needed or opportunity_selected
+        charging_needed = (
+            deficit_charging_needed or opportunity_selected or bool(planned_arbitrage_kwh)
+        )
         schedule_type = self._schedule_type_from_purposes(slot_purposes.values())
 
         schedule = DynamicPricingSchedule(
@@ -3743,6 +4488,10 @@ class PricingManager:
             negative_price_energy_kwh=(
                 negative_price_energy_kwh if opportunity_selected else 0.0
             ),
+            arbitrage_charging_needed=bool(planned_arbitrage_kwh),
+            arbitrage_energy_kwh=sum(planned_arbitrage_kwh.values()),
+            slot_arbitrage_kwh=planned_arbitrage_kwh,
+            arbitrage_plan=arbitrage_plan,
             slot_energy_targets_kwh=(
                 {
                     allocation.slot: allocation.planned_battery_kwh
@@ -3831,6 +4580,7 @@ class PricingManager:
             unit=self._get_price_unit(),
             max_price_threshold=self._controller.max_price_threshold,
             discharge_price_threshold=self._controller.discharge_price_threshold,
+            arbitrage_plan=getattr(self._controller, "_dp_last_arbitrage_plan", None),
             arbitrage_ceiling=self._controller._dp_arbitrage_ceiling,
             max_contracted_power=self._controller.max_contracted_power,
             max_charge_capacity=self._controller.max_charge_capacity,
@@ -3948,6 +4698,10 @@ class PricingManager:
             if hasattr(schedule, "purpose_for")
             else SLOT_PURPOSE_DEFICIT
         )
+        if purpose == SLOT_PURPOSE_ARBITRAGE:
+            self._reevaluate_arbitrage_slot(next_slot, now)
+            return
+
         has_deficit = purpose in {SLOT_PURPOSE_DEFICIT, SLOT_PURPOSE_COMBINED}
         has_opportunity = purpose in {
             SLOT_PURPOSE_NEGATIVE_PRICE,
@@ -5528,6 +6282,16 @@ class PricingManager:
                 horizon=DynamicPricingEvaluationHorizon.REMAINING,
             )
 
+        # Phase 2.95: arbitrage-only refresh, hourly. After the full triggers
+        # above so a rebuild that just ran (and re-planned arbitrage) wins.
+        if self._arbitrage_refresh_due(now):
+            try:
+                self._refresh_arbitrage_plan(now)
+            except Exception as err:  # noqa: BLE001
+                # Never let an optional plan break the control loop.
+                self._controller._dp_arbitrage_refreshed_at = now
+                _LOGGER.warning("Arbitrage refresh failed: %s", err)
+
         # Phase 3: Daily reset at midnight
         today = now.date()
         if self._controller._dynamic_pricing_evaluated_date is not None:
@@ -5549,6 +6313,7 @@ class PricingManager:
                         "slot_energy_targets_kwh",
                         "slot_deadlines",
                         "slot_plan_kinds",
+                        "slot_arbitrage_kwh",
                     ):
                         values = getattr(schedule, attribute, None)
                         if isinstance(values, dict):

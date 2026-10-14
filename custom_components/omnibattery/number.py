@@ -19,6 +19,8 @@ from .const import (
     CONF_MAX_PRICE_THRESHOLD,
     CONF_DISCHARGE_PRICE_THRESHOLD,
     CONF_MIN_ARBITRAGE_MARGIN,
+    CONF_ARBITRAGE_WEAR_COST,
+    DEFAULT_ARBITRAGE_WEAR_COST,
     CONF_ROUND_TRIP_EFFICIENCY,
     DEFAULT_ROUND_TRIP_EFFICIENCY,
     MIN_ROUND_TRIP_EFFICIENCY,
@@ -156,6 +158,7 @@ async def async_setup_entry(
         entities.append(MarstekPriceThresholdNumber(hass, entry, "discharge"))
         entities.append(MarstekArbitrageNumber(hass, entry, "margin"))
         entities.append(MarstekArbitrageNumber(hass, entry, "efficiency"))
+        entities.append(ArbitrageWearCostNumber(hass, entry))
         entities.append(SmartPredischargeNumber(hass, entry, "threshold"))
         entities.append(SmartPredischargeNumber(hass, entry, "reserve"))
 
@@ -583,6 +586,59 @@ class MarstekArbitrageNumber(NumberEntity):
     @property
     def device_info(self):
         """Return device information for the system."""
+        return {
+            "identifiers": {(DOMAIN, "marstek_venus_system")},
+            "name": "Omnibattery System",
+            "manufacturer": "Omnibattery",
+            "model": "Multi-Battery System",
+        }
+
+
+class ArbitrageWearCostNumber(NumberEntity):
+    """Cost of cycling the battery, per grid kWh bought for price arbitrage.
+
+    Deducted from every planned trade on top of the round-trip losses and the
+    minimum arbitrage margin. Zero ignores wear. It lives in ``config_entry.data``
+    like the other pricing numbers; the entry listener replans when it moves.
+    """
+
+    _attr_has_entity_name = True
+    _attr_mode = NumberMode.BOX
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_should_poll = False
+    _attr_native_min_value = 0.0
+    _attr_native_max_value = 0.5
+    _attr_native_step = 0.001
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.hass = hass
+        self.entry = entry
+        self._attr_translation_key = CONF_ARBITRAGE_WEAR_COST
+        self._attr_unique_id = f"{SYSTEM_UNIQUE_ID_PREFIX}{CONF_ARBITRAGE_WEAR_COST}"
+        self.entity_id = system_entity_id("number", CONF_ARBITRAGE_WEAR_COST)
+        self._attr_icon = "mdi:battery-heart-variant"
+        is_chf = entry.data.get(CONF_PRICE_INTEGRATION_TYPE) == PRICE_INTEGRATION_CKW
+        self._attr_native_unit_of_measurement = "CHF/kWh" if is_chf else "\u20ac/kWh"
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.entry.add_update_listener(self._handle_entry_update))
+
+    async def _handle_entry_update(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self):
+        return self.entry.data.get(CONF_ARBITRAGE_WEAR_COST, DEFAULT_ARBITRAGE_WEAR_COST)
+
+    async def async_set_native_value(self, value: float) -> None:
+        new_data = dict(self.entry.data)
+        new_data[CONF_ARBITRAGE_WEAR_COST] = value
+        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        _LOGGER.info("Arbitrage wear cost updated to %s", value)
+        self.async_write_ha_state()
+
+    @property
+    def device_info(self):
         return {
             "identifiers": {(DOMAIN, "marstek_venus_system")},
             "name": "Omnibattery System",

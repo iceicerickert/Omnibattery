@@ -509,6 +509,13 @@ def _dynamic_pricing_info(controller) -> dict[str, Any]:
         "solar_forecast_remaining_sensor": getattr(
             controller, "solar_forecast_remaining_sensor", None
         ),
+        "arbitrage_charging_enabled": getattr(
+            controller, "arbitrage_charging_enabled", False
+        ),
+        "arbitrage_wear_cost": getattr(controller, "arbitrage_wear_cost", None),
+        "arbitrage_export_enabled": getattr(
+            controller, "arbitrage_export_enabled", False
+        ),
         "negative_price_charging_enabled": getattr(
             controller, "negative_price_charging_enabled", False
         ),
@@ -556,6 +563,10 @@ def _dynamic_pricing_info(controller) -> dict[str, Any]:
             "negative_price_energy_kwh": getattr(
                 schedule, "negative_price_energy_kwh", 0.0
             ),
+            "arbitrage_charging_needed": getattr(
+                schedule, "arbitrage_charging_needed", False
+            ),
+            "arbitrage_energy_kwh": getattr(schedule, "arbitrage_energy_kwh", 0.0),
             "selected_slots": [
                 {
                     "start": (

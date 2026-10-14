@@ -165,6 +165,12 @@ from .const import (
     DEFAULT_PREDISCHARGE_RESERVE_SOC,
     CONF_NEGATIVE_PRICE_CHARGING_ENABLED,
     DEFAULT_NEGATIVE_PRICE_CHARGING_ENABLED,
+    CONF_ARBITRAGE_CHARGING_ENABLED,
+    DEFAULT_ARBITRAGE_CHARGING_ENABLED,
+    CONF_ARBITRAGE_WEAR_COST,
+    DEFAULT_ARBITRAGE_WEAR_COST,
+    CONF_ARBITRAGE_EXPORT_ENABLED,
+    DEFAULT_ARBITRAGE_EXPORT_ENABLED,
     CONF_DISCHARGE_RESERVE_ENABLED,
     CONF_DISCHARGE_RESERVE_MIN_SAVING,
     DEFAULT_DISCHARGE_RESERVE_ENABLED,
@@ -274,6 +280,7 @@ from .control.temperature_limit import TemperatureChargeLimitManager
 from .control.phase_power_limit import PhasePowerLimiter
 from .pricing import (
     DynamicPricingSchedule,
+    SLOT_PURPOSE_ARBITRAGE,
     SLOT_PURPOSE_COMBINED,
     SLOT_PURPOSE_DEFICIT,
     SLOT_PURPOSE_NEGATIVE_PRICE,
@@ -1047,6 +1054,15 @@ class ChargeDischargeController:
         self.negative_price_charging_enabled = config_entry.data.get(
             CONF_NEGATIVE_PRICE_CHARGING_ENABLED,
             DEFAULT_NEGATIVE_PRICE_CHARGING_ENABLED,
+        )
+        self.arbitrage_charging_enabled = config_entry.data.get(
+            CONF_ARBITRAGE_CHARGING_ENABLED, DEFAULT_ARBITRAGE_CHARGING_ENABLED
+        )
+        self.arbitrage_wear_cost = config_entry.data.get(
+            CONF_ARBITRAGE_WEAR_COST, DEFAULT_ARBITRAGE_WEAR_COST
+        )
+        self.arbitrage_export_enabled = config_entry.data.get(
+            CONF_ARBITRAGE_EXPORT_ENABLED, DEFAULT_ARBITRAGE_EXPORT_ENABLED
         )
         self.surplus_price_hold_enabled = config_entry.data.get(
             CONF_SURPLUS_PRICE_HOLD_ENABLED, DEFAULT_SURPLUS_PRICE_HOLD_ENABLED
@@ -1996,6 +2012,16 @@ class ChargeDischargeController:
         projection_horizon_end = local_midnight + timedelta(hours=12)
         if mode == "dynamic_pricing" and schedule is not None:
             raw_slots = list(getattr(schedule, "selected_slots", ()) or ())
+            purpose_for = getattr(schedule, "purpose_for", None)
+            if callable(purpose_for):
+                # Arbitrage energy is sized by its own plan, not by the deficit
+                # this projection simulates, so it is left out of the picture
+                # rather than drawn with the wrong amount. The arbitrage plan
+                # sensor carries it.
+                raw_slots = [
+                    slot for slot in raw_slots
+                    if purpose_for(slot) != SLOT_PURPOSE_ARBITRAGE
+                ]
         elif mode == "time_slot":
             try:
                 # The dashboard deliberately looks beyond today's control
@@ -2887,6 +2913,13 @@ class ChargeDischargeController:
             self._predictive_safety_margin_kwh,
         )
         old_negative_price_enabled = self.negative_price_charging_enabled
+        old_arbitrage_config = (
+            self.arbitrage_charging_enabled,
+            self.arbitrage_export_enabled,
+            self.arbitrage_wear_cost,
+            self.min_arbitrage_margin,
+            self.round_trip_efficiency,
+        )
         # Update weekly full charge settings; reset completion state if day changed
         new_weekly_day = self.config_entry.data.get(CONF_WEEKLY_FULL_CHARGE_DAY, "sun")
         new_weekly_enabled = self.config_entry.data.get(CONF_ENABLE_WEEKLY_FULL_CHARGE, False)
@@ -3002,6 +3035,22 @@ class ChargeDischargeController:
             CONF_NEGATIVE_PRICE_CHARGING_ENABLED,
             DEFAULT_NEGATIVE_PRICE_CHARGING_ENABLED,
         )
+        self.arbitrage_charging_enabled = self.config_entry.data.get(
+            CONF_ARBITRAGE_CHARGING_ENABLED, DEFAULT_ARBITRAGE_CHARGING_ENABLED
+        )
+        self.arbitrage_wear_cost = self.config_entry.data.get(
+            CONF_ARBITRAGE_WEAR_COST, DEFAULT_ARBITRAGE_WEAR_COST
+        )
+        self.arbitrage_export_enabled = self.config_entry.data.get(
+            CONF_ARBITRAGE_EXPORT_ENABLED, DEFAULT_ARBITRAGE_EXPORT_ENABLED
+        )
+        new_arbitrage_config = (
+            self.arbitrage_charging_enabled,
+            self.arbitrage_export_enabled,
+            self.arbitrage_wear_cost,
+            self.min_arbitrage_margin,
+            self.round_trip_efficiency,
+        )
         new_curtailment_config = (
             self.negative_injection_threshold,
             self.predischarge_reserve_soc,
@@ -3095,6 +3144,20 @@ class ChargeDischargeController:
             self._pricing_mgr.clear_negative_price_runtime(
                 "mode_or_configuration_changed"
             )
+
+        if (
+            old_arbitrage_config != new_arbitrage_config
+            or old_pricing_mode != self.predictive_charging_mode
+            or self.predictive_charging_mode != PREDICTIVE_MODE_DYNAMIC_PRICING
+        ):
+            # The plan was priced with the old inputs. Withdraw it, and when the
+            # feature is still on, plan again now rather than at the next
+            # scheduled evaluation.
+            self._pricing_mgr.clear_arbitrage_runtime(
+                "mode_or_configuration_changed"
+            )
+            if old_arbitrage_config != new_arbitrage_config:
+                self._schedule_arbitrage_reevaluation()
 
         # Hourly balance: ON→OFF cleans up offset; flag change is enough for async_process to react
         new_hb_enabled = self.config_entry.data.get(CONF_ENABLE_HOURLY_BALANCE, False)
@@ -5709,6 +5772,82 @@ class ChargeDischargeController:
             targets[coordinator] = target
         return targets or None
 
+    def _schedule_arbitrage_reevaluation(self) -> None:
+        """Rebuild today's calendar in the background after an arbitrage setting moved."""
+        if not (
+            getattr(self, "arbitrage_charging_enabled", False)
+            and getattr(self, "predictive_charging_enabled", False)
+            and getattr(self, "predictive_charging_mode", None)
+            == PREDICTIVE_MODE_DYNAMIC_PRICING
+        ):
+            return
+        create = getattr(getattr(self, "hass", None), "async_create_task", None)
+        if not callable(create):
+            return
+
+        async def _run() -> None:
+            try:
+                await self._pricing_mgr._evaluate_dynamic_pricing(
+                    horizon=DynamicPricingEvaluationHorizon.REMAINING,
+                    extended_horizon=True,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Arbitrage re-evaluation failed: %s", err)
+                self._pricing_mgr.clear_arbitrage_runtime("evaluation_error")
+
+        create(_run())
+
+    def _compute_arbitrage_target_soc(self, slot=None) -> Optional[dict]:
+        """Stop SOCs for the active arbitrage slot: its planned energy, no more.
+
+        The planned battery-side kWh are split over the batteries by their gap
+        to the charge ceiling, like the deficit split. A slot without a planned
+        figure targets each battery's current SOC, so it completes at once;
+        falling back to the charge ceiling would turn a lost plan into a full
+        charge.
+        """
+        schedule = getattr(self, "_dynamic_pricing_schedule", None)
+        if slot is None:
+            slot = getattr(self, "_active_dynamic_price_slot", None)
+        planned_kwh = 0.0
+        if schedule is not None and slot is not None:
+            try:
+                planned_kwh = max(
+                    0.0,
+                    float(getattr(schedule, "slot_arbitrage_kwh", {}).get(slot, 0.0) or 0.0),
+                )
+            except (TypeError, ValueError):
+                planned_kwh = 0.0
+
+        entries = []
+        for coordinator in self.coordinators:
+            if ChargeDischargeController._is_battery_manual_owned(coordinator):
+                continue
+            data = coordinator.data
+            if not data or not getattr(coordinator, "is_available", True):
+                continue
+            try:
+                soc = float(data.get("battery_soc", 0.0) or 0.0)
+                capacity = float(data.get("battery_total_energy", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            ceiling = ChargeDischargeController._charge_ceiling_soc(self, coordinator)
+            gap = max(0.0, (ceiling - soc) / 100.0 * capacity) if capacity > 0 else 0.0
+            entries.append((coordinator, soc, capacity, ceiling, gap))
+        if not entries:
+            return None
+
+        total_gap = sum(entry[4] for entry in entries)
+        energy = min(planned_kwh, total_gap)
+        targets = {}
+        for coordinator, soc, capacity, ceiling, gap in entries:
+            if energy <= 0.0 or total_gap <= 0.0 or capacity <= 0.0:
+                targets[coordinator] = soc
+                continue
+            share = energy * gap / total_gap
+            targets[coordinator] = max(soc, min(ceiling, soc + share / capacity * 100.0))
+        return targets
+
     def _compute_predictive_target_soc(self, *, log: bool = True) -> Optional[dict]:
         """Return the SOC target authorized by the active typed price slot.
 
@@ -5717,6 +5856,10 @@ class ChargeDischargeController:
         marked ``negative_price`` or ``combined`` by the pricing calendar.
         """
         purpose = getattr(self, "_active_dynamic_slot_purpose", None)
+        if purpose == SLOT_PURPOSE_ARBITRAGE:
+            # Arbitrage energy is sized by its own plan, never by the deficit.
+            self._predictive_deficit_target_soc = None
+            return ChargeDischargeController._compute_arbitrage_target_soc(self)
         # Call the helpers through the class so this method remains usable in
         # the lightweight controller stand-ins used by the planning tests.
         planned_kwh = None

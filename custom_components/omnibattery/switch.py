@@ -39,6 +39,8 @@ from .const import (
     CONF_PRICE_DISCHARGE_CONTROL,
     CONF_SMART_PREDISCHARGE_ENABLED,
     CONF_NEGATIVE_PRICE_CHARGING_ENABLED,
+    CONF_ARBITRAGE_CHARGING_ENABLED,
+    CONF_ARBITRAGE_EXPORT_ENABLED,
     PREDICTIVE_MODE_DYNAMIC_PRICING,
     PREDICTIVE_MODE_REALTIME_PRICE,
     CONF_SYSTEM_MAX_CHARGE_POWER,
@@ -112,6 +114,8 @@ async def async_setup_entry(
             entities.append(PriceDischargeControlSwitch(hass, entry, controller))
             entities.append(SmartPredischargeSwitch(hass, entry, controller))
             entities.append(NegativePriceChargingSwitch(hass, entry, controller))
+            entities.append(ArbitrageChargingSwitch(hass, entry, controller))
+            entities.append(ArbitrageExportSwitch(hass, entry, controller))
         elif mode == PREDICTIVE_MODE_REALTIME_PRICE:
             entities.append(PriceDischargeControlSwitch(hass, entry, controller))
 
@@ -2318,3 +2322,103 @@ class NegativePriceChargingSwitch(SwitchEntity):
             "manufacturer": "Omnibattery",
             "model": "Multi-Battery System",
         }
+
+
+class ArbitrageChargingSwitch(SwitchEntity):
+    """Runtime opt-in for buying extra energy in cheap slots to use in dear ones."""
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, controller) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.controller = controller
+        self._attr_has_entity_name = True
+        self._attr_translation_key = "arbitrage_charging"
+        self._attr_unique_id = f"{SYSTEM_UNIQUE_ID_PREFIX}arbitrage_charging"
+        self.entity_id = system_entity_id("switch", "arbitrage_charging")
+        self._attr_icon = "mdi:swap-vertical-bold"
+        self._attr_should_poll = False
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.controller.arbitrage_charging_enabled)
+
+    async def async_turn_on(self, **kwargs) -> None:
+        """Enable the feature and plan straight away.
+
+        The flag is set before the entry is written, so the entry listener sees
+        no change and would not plan; the switch asks for it itself.
+        """
+        self.controller.arbitrage_charging_enabled = True
+        new_data = dict(self.entry.data)
+        new_data[CONF_ARBITRAGE_CHARGING_ENABLED] = True
+        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        self.controller._schedule_arbitrage_reevaluation()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        """Disable and withdraw every arbitrage slot from the live schedule."""
+        self.controller.arbitrage_charging_enabled = False
+        new_data = dict(self.entry.data)
+        new_data[CONF_ARBITRAGE_CHARGING_ENABLED] = False
+        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        self.controller._pricing_mgr.clear_arbitrage_runtime("disabled")
+        self.async_write_ha_state()
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "marstek_venus_system")},
+            "name": "Omnibattery System",
+            "manufacturer": "Omnibattery",
+            "model": "Multi-Battery System",
+        }
+
+
+class ArbitrageExportSwitch(SwitchEntity):
+    """Also buy extra energy in cheap slots to sell it in the dear ones.
+
+    Needs price arbitrage charging. Sales go through the High-Price Sale
+    machinery, which only releases energy that is really in the battery and that
+    the house does not need before sunrise.
+    """
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, controller) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.controller = controller
+        self._attr_has_entity_name = True
+        self._attr_translation_key = "arbitrage_export"
+        self._attr_unique_id = f"{SYSTEM_UNIQUE_ID_PREFIX}arbitrage_export"
+        self.entity_id = system_entity_id("switch", "arbitrage_export")
+        self._attr_icon = "mdi:transmission-tower-export"
+        self._attr_should_poll = False
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.controller.arbitrage_export_enabled)
+
+    async def _set(self, enabled: bool) -> None:
+        self.controller.arbitrage_export_enabled = enabled
+        new_data = dict(self.entry.data)
+        new_data[CONF_ARBITRAGE_EXPORT_ENABLED] = enabled
+        self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+        # The flag was set first, so the entry listener sees no change; plan
+        # again explicitly, which also withdraws planned sales when turned off.
+        self.controller._schedule_arbitrage_reevaluation()
+        self.async_write_ha_state()
+
+    async def async_turn_on(self, **kwargs) -> None:
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        await self._set(False)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, "marstek_venus_system")},
+            "name": "Omnibattery System",
+            "manufacturer": "Omnibattery",
+            "model": "Multi-Battery System",
+        }
+
