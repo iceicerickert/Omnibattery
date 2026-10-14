@@ -106,7 +106,7 @@ content: |-
   {%- set nowts = as_timestamp(now()) %}
   {%- set endts = as_timestamp(state_attr(dr, 'horizon_end')) if state_attr(dr, 'horizon_end') else nowts + 86400 %}
   {%- set ns = namespace(minp=none, lo=none, loat='', hi=none, hiat='', best=none, buyp=0, usep=0) %}
-  {%- for e in fc if as_timestamp(e.end_date) > nowts and as_timestamp(e.start_date) < endts %}
+  {%- for e in fc if as_timestamp(e.start_date) >= nowts and as_timestamp(e.start_date) < endts %}
   {%- set pr = (e.price_tax_included.amount if e.price_tax_included is defined else e.electricity_price) / 10000000 %}
   {%- if ns.minp is not none %}
   {%- set net = rte * pr - ns.minp - wear %}
