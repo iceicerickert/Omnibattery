@@ -663,3 +663,124 @@ def test_export_off_keeps_household_plans_unchanged():
     # No export prices on those slots: the flag changes nothing.
     assert with_flag.total_stored_kwh == pytest.approx(without.total_stored_kwh)
     assert with_flag.expected_gain == pytest.approx(without.expected_gain)
+
+
+# ---------------------------------------------------------------------------
+# Selling energy that is already in the battery
+# ---------------------------------------------------------------------------
+
+
+def _stock_day(*, refill_price=0.25, dear=0.50, export=None):
+    """Evening peak today; cheap hours tomorrow to buy back."""
+    export = dear if export is None else export
+    slots = []
+    for hour in range(18, 22):
+        slots.append(_slot(hour, dear, export_price=export))
+    return slots
+
+
+def _refill(prices):
+    return [
+        ArbitrageSlot(DAY + timedelta(hours=h), DAY + timedelta(hours=h + 1), price)
+        for h, price in prices
+    ]
+
+
+def test_a_full_battery_still_sells_what_the_house_does_not_need():
+    slots = _stock_day()
+    plan = _plan(
+        slots, allow_export=True, usable_energy_kwh=10.0, free_space_kwh=0.0,
+        refill_slots=_refill([(30, 0.25), (31, 0.25), (32, 0.25), (33, 0.25)]),
+        charge_power_kw=3.0,
+    )
+    assert plan.planned
+    assert plan.charges == ()
+    assert plan.export_kwh > 0
+    assert all(d.stock_kwh == pytest.approx(d.stored_kwh) for d in plan.exports)
+    assert plan.expected_gain > 0
+
+
+def test_the_house_keeps_what_it_needs_before_anything_is_sold():
+    slots = [_slot(18, 0.50, demand=2.0, export_price=0.50), _slot(19, 0.50, export_price=0.50)]
+    plan = _plan(
+        slots, allow_export=True, usable_energy_kwh=4.0, free_space_kwh=0.0,
+        refill_slots=_refill([(30, 0.20), (31, 0.20), (32, 0.20)]),
+        discharge_power_kw=10.0,
+    )
+    # 2 kWh delivered for the house is 2 / eta stored; only the rest is sold.
+    assert plan.export_kwh <= 4.0 - 2.0 / ETA + 1e-9
+
+
+def test_stored_energy_is_not_sold_without_a_believable_refill():
+    slots = _stock_day()
+    for refill in ([], _refill([(30, 0.60)]), _refill([(30, 0.60), (31, 0.60)])):
+        plan = _plan(
+            slots, allow_export=True, usable_energy_kwh=10.0, free_space_kwh=0.0,
+            refill_slots=refill,
+        )
+        assert not plan.planned
+
+
+def test_a_refill_that_is_too_small_to_replace_the_sale_is_priced_on_enough_hours():
+    slots = _stock_day()
+    cheap_but_tiny = _refill([(30, 0.05)])  # one hour cannot refill 10 kWh at 3 kW
+    padded = _refill([(30, 0.05)] + [(31 + i, 0.45) for i in range(6)])
+    one = _plan(slots, allow_export=True, usable_energy_kwh=10.0, free_space_kwh=0.0,
+                refill_slots=cheap_but_tiny)
+    many = _plan(slots, allow_export=True, usable_energy_kwh=10.0, free_space_kwh=0.0,
+                 refill_slots=padded)
+    assert not one.planned  # cannot buy it all back in time
+    assert many.expected_gain < _plan(
+        slots, allow_export=True, usable_energy_kwh=10.0, free_space_kwh=0.0,
+        refill_slots=_refill([(30 + i, 0.05) for i in range(6)]),
+    ).expected_gain
+
+
+def test_a_sale_of_stored_energy_must_clear_wear_and_margin():
+    slots = _stock_day(dear=0.40)
+    refill = _refill([(30 + i, 0.25) for i in range(6)])
+    kwargs = dict(allow_export=True, usable_energy_kwh=10.0, free_space_kwh=0.0, refill_slots=refill)
+    assert _plan(slots, **kwargs).planned
+    assert not _plan(slots, wear_cost=0.2, **kwargs).planned
+    assert not _plan(slots, min_margin=0.3, **kwargs).planned
+
+
+def test_stored_energy_is_only_sold_when_export_is_allowed():
+    plan = _plan(
+        _stock_day(), usable_energy_kwh=10.0, free_space_kwh=0.0,
+        refill_slots=_refill([(30 + i, 0.25) for i in range(6)]),
+    )
+    assert not plan.planned
+
+
+def test_stored_energy_sales_respect_the_discharge_power():
+    slots = _stock_day()
+    plan = _plan(
+        slots, allow_export=True, usable_energy_kwh=20.0, free_space_kwh=0.0,
+        refill_slots=_refill([(30 + i, 0.25) for i in range(10)]),
+        discharge_power_kw=1.0,
+    )
+    assert all(d.delivered_kwh <= 1.0 + 1e-9 for d in plan.exports)
+
+
+def test_a_refill_at_a_dear_price_means_no_sale_of_stored_energy():
+    slots = _stock_day(dear=0.50)
+    plan = _plan(
+        slots, allow_export=True, usable_energy_kwh=10.0, free_space_kwh=0.0,
+        refill_slots=_refill([(30 + i, 0.48) for i in range(8)]),
+    )
+    assert not plan.planned
+
+
+def test_stock_and_purchases_share_the_export_slots_without_exceeding_them():
+    slots = [_slot(12, 0.20)] + _stock_day()
+    plan = _plan(
+        slots, allow_export=True, usable_energy_kwh=6.0, free_space_kwh=4.0,
+        refill_slots=_refill([(30 + i, 0.25) for i in range(10)]),
+        discharge_power_kw=2.0,
+    )
+    per_slot = {}
+    for d in plan.exports:
+        per_slot[d.start] = per_slot.get(d.start, 0.0) + d.delivered_kwh
+    assert all(v <= 2.0 + 1e-9 for v in per_slot.values())
+    assert plan.total_stored_kwh <= 4.0 + 1e-9

@@ -569,3 +569,100 @@ def test_the_bonus_follows_the_season(monkeypatch):
     winter = _bonus_manager(monkeypatch, sunrise_h=8, sunset_h=17)
     prices = [s.price for s in winter._apply_zonneplan_export_bonus(_slots_at(6, 21), "zonneplan")]
     assert prices == [0.50, 0.50]
+
+
+# ---------------------------------------------------------------------------
+# Selling what the battery already holds
+# ---------------------------------------------------------------------------
+
+DEAR_THEN_CHEAP = [0.50] * 4 + [0.25] * 10
+
+
+def _full_battery_controller(**kwargs):
+    ctrl = _export_controller([_Battery("b1", 99, 10)], **kwargs)
+    ctrl.min_arbitrage_margin = 0.03
+    return ctrl
+
+
+def test_a_full_battery_plans_a_sale_of_its_spare_energy():
+    ctrl = _full_battery_controller()
+    slots = _future_slots(DEAR_THEN_CHEAP)
+    manager = _manager(ctrl, slots)
+    _with_export_curve(manager, slots)
+    asyncio.run(manager._evaluate_dynamic_pricing(horizon=_daily()))
+
+    plan = ctrl._dp_last_arbitrage_plan
+    assert plan.planned
+    assert plan.charges == ()
+    assert plan.exports
+    assert all(d.stock_kwh > 0 for d in plan.exports)
+    # Nothing to buy means no arbitrage slots in the calendar.
+    schedule = ctrl._dynamic_pricing_schedule
+    assert schedule is None or not schedule.arbitrage_charging_needed
+
+
+def test_the_sale_manager_receives_the_sale_of_stored_energy():
+    ctrl = _full_battery_controller()
+    slots = _future_slots(DEAR_THEN_CHEAP)
+    manager = _manager(ctrl, slots)
+    _with_export_curve(manager, slots)
+    asyncio.run(manager._evaluate_dynamic_pricing(horizon=_daily()))
+    sale_manager = HighPriceDischargeManager(SimpleNamespace(), ctrl)
+    requests = sale_manager._arbitrage_exports(datetime.now())
+    assert requests
+    assert sum(r.energy_kwh for r in requests) == pytest.approx(
+        sum(d.delivered_kwh for d in ctrl._dp_last_arbitrage_plan.exports)
+    )
+
+
+def test_the_hourly_refresh_keeps_selling_after_the_purchase_has_happened():
+    # The morning plan bought extra to sell. By the afternoon the battery is
+    # full, so a fresh plan has nothing to buy; the sale must survive that.
+    battery = _Battery("b1", 20, 10)
+    ctrl = _export_controller([battery])
+    ctrl.min_arbitrage_margin = 0.03
+    slots = _future_slots([0.25] * 4 + [0.50] * 4 + [0.25] * 8)
+    manager = _refreshable(ctrl, slots)
+    _with_export_curve(manager, slots)
+    manager._refresh_arbitrage_plan(datetime.now())
+    first = ctrl._dp_last_arbitrage_plan
+    assert first.exports
+
+    battery.data["battery_soc"] = 99.0  # the planned purchase has been made
+    manager._refresh_arbitrage_plan(datetime.now())
+    second = ctrl._dp_last_arbitrage_plan
+    assert second.planned
+    assert second.charges == ()
+    assert second.exports
+
+
+def test_selling_stored_energy_needs_the_switch_and_a_refill_price():
+    off = _full_battery_controller(export=False)
+    slots = _future_slots(DEAR_THEN_CHEAP)
+    manager = _manager(off, slots)
+    _with_export_curve(manager, slots)
+    asyncio.run(manager._evaluate_dynamic_pricing(horizon=_daily()))
+    assert not off._dp_last_arbitrage_plan.exports
+
+    # Nothing cheaper to buy back later: no sale.
+    on = _full_battery_controller()
+    flat = _future_slots([0.50] * 14)
+    manager = _manager(on, flat)
+    _with_export_curve(manager, flat)
+    asyncio.run(manager._evaluate_dynamic_pricing(horizon=_daily()))
+    assert not on._dp_last_arbitrage_plan.exports
+
+
+def test_a_sale_only_plan_is_reported_and_notified_without_a_purchase():
+    ctrl = _full_battery_controller()
+    slots = _future_slots(DEAR_THEN_CHEAP)
+    manager = _manager(ctrl, slots)
+    _with_export_curve(manager, slots)
+    asyncio.run(manager._evaluate_dynamic_pricing(horizon=_daily()))
+    info = manager.arbitrage_status()
+    assert info["status"] == "planned"
+    assert info["charges"] == []
+    assert info["export_kwh"] > 0
+    json.dumps(info)
+    text = notifications.format_arbitrage_lines(ctrl._dp_last_arbitrage_plan, unit="€/kWh")
+    assert "stored energy" in text and "bought back" in text

@@ -12,6 +12,7 @@ Changes carried by this fork on top of upstream (ffunes/Omnibattery). Kept in it
   - Re-planned one hour before each arbitrage slot and with every plan rebuild; needs the Discharge Reserve or Price-Based Discharge.
   - Notifications gained an arbitrage section; diagnostics export the new fields.
   - **Sell extra** (opt-in switch `arbitrage_export`): also buy extra in cheap periods to export in dear ones. The planner values exports at the export price curve; the High-Price Sale machinery releases the energy only when it is really there and beyond the demand protected until sunrise; the discharge reserve holds it until then. Power comes from the batteries' charge and discharge limits, nothing is hardcoded.
+  - Spare **stored** energy is sold too, bought back at the cheapest later hours of the published curve; without this a plan vanished the moment its purchase had made the battery full.
   - Arbitrage is re-planned every hour on its own (arbitrage slots only), not just on full plan rebuilds.
   - The dashboard card explains why nothing is planned (battery, demand, already-planned grid charge).
 

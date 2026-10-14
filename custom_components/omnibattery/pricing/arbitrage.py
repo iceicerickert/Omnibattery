@@ -52,6 +52,8 @@ EPSILON = 1e-9
 # Allocations below this are noise: a 0.03 kWh slot would still start a charge
 # session, a notification and a handover.
 MIN_ALLOCATION_KWH = 0.1
+# A sale of stored energy has no start-up cost of its own, only the export slot.
+MIN_STOCK_SALE_KWH = 0.05
 
 STATUS_DISABLED = "disabled"
 STATUS_PLANNED = "planned"
@@ -146,6 +148,9 @@ class ArbitrageDischarge:
     kind: str = KIND_HOUSEHOLD
     # Energy that leaves the battery for the house or the grid, after losses.
     delivered_kwh: float = 0.0
+    # Part of an export that comes from energy already in the battery (not
+    # bought for this plan), to be bought back later at the refill price.
+    stock_kwh: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -182,7 +187,7 @@ class ArbitragePlan:
 
     @property
     def planned(self) -> bool:
-        return self.status == STATUS_PLANNED and bool(self.charges)
+        return self.status == STATUS_PLANNED and bool(self.charges or self.discharges)
 
     @property
     def exports(self) -> tuple[ArbitrageDischarge, ...]:
@@ -238,6 +243,42 @@ def _simulate(
     return mids, ends, lost
 
 
+def _refill_price(
+    slots: Sequence[ArbitrageSlot],
+    after: datetime,
+    need_stored_kwh: float,
+    charge_power_kw: float,
+    eta: float,
+    ceiling: float | None,
+) -> float | None:
+    """What buying back ``need_stored_kwh`` after ``after`` would cost per grid kWh.
+
+    The cheapest later slots are filled up to their charge power, so selling a
+    lot and re-buying a lot is priced at the average of enough cheap hours, not
+    at the single cheapest quarter. None when they cannot supply it (fail safe:
+    no sale of stored energy is planned without a believable way to refill).
+    """
+    if need_stored_kwh <= EPSILON or charge_power_kw <= EPSILON:
+        return None
+    candidates = sorted(
+        (float(slot.price), slot.duration_hours)
+        for slot in slots
+        if slot.start >= after
+        and _finite(slot.price)
+        and slot.duration_hours > EPSILON
+        and (ceiling is None or float(slot.price) <= ceiling)
+    )
+    got = 0.0
+    cost = 0.0
+    for price, hours in candidates:
+        take = min(charge_power_kw * hours * eta, need_stored_kwh - got)
+        cost += take * price
+        got += take
+        if got >= need_stored_kwh - EPSILON:
+            return cost / got
+    return None
+
+
 def plan_arbitrage(
     slots: Sequence[ArbitrageSlot],
     *,
@@ -253,6 +294,7 @@ def plan_arbitrage(
     min_margin: float = 0.0,
     max_charge_price: float | None = None,
     allow_export: bool = False,
+    refill_slots: Sequence[ArbitrageSlot] = (),
 ) -> ArbitragePlan:
     """Plan extra grid purchases that pay for themselves later.
 
@@ -377,12 +419,31 @@ def plan_arbitrage(
         if take > EPSILON:
             baseline_out[index] += take
 
-    mids, _ends, _lost = _simulate(level0, cap, pv, zeros, baseline_out)
+    mids, ends, _lost = _simulate(level0, cap, pv, zeros, baseline_out)
     unserved = [max(0.0, demand[i] - baseline_out[i]) for i in range(count)]
     unserved_total = sum(unserved)
     export_total = sum(export_room)
 
-    if sum(charge_room) <= EPSILON:
+    # Energy already in the battery beyond what the house needs until the end of
+    # the horizon may also be sold, if it can be bought back later at a price
+    # that leaves the margin. That is what keeps a plan alive after the extra
+    # energy has been bought: the battery is then full, there is nothing left to
+    # buy, but there is something to sell.
+    stock_price: float | None = None
+    if allow_export and refill_slots and export_total > EPSILON:
+        sale_indexes = [i for i in range(count) if export_room[i] > EPSILON]
+        stock_cap = max((min(ends[i:]) for i in sale_indexes), default=0.0)
+        if stock_cap > EPSILON:
+            stock_price = _refill_price(
+                refill_slots,
+                future[sale_indexes[0]].end,
+                stock_cap,
+                charge_kw,
+                eta,
+                float(max_charge_price) if max_charge_price is not None else None,
+            )
+
+    if sum(charge_room) <= EPSILON and stock_price is None:
         return ArbitragePlan(
             status=STATUS_NOTHING_PROFITABLE,
             reason=REASON_NO_CHARGE_SLOTS,
@@ -422,6 +483,14 @@ def plan_arbitrage(
                 )
                 if profit > EPSILON and profit >= margin:
                     pairs.append((profit, c, d, KIND_EXPORT))
+    if stock_price is not None:
+        for d in range(count):
+            if export_room[d] > EPSILON:
+                profit = profit_per_grid_kwh(
+                    stock_price, float(future[d].export_price), rte, wear
+                )
+                if profit > EPSILON and profit >= margin:
+                    pairs.append((profit, -1, d, KIND_EXPORT))
     if not pairs:
         return ArbitragePlan(
             status=STATUS_NOTHING_PROFITABLE,
@@ -445,7 +514,19 @@ def plan_arbitrage(
     used_house = [0.0] * count
     used_export = [0.0] * count
     linked: list[tuple[int, int, float, float, str]] = []
+    ends_work = list(ends)
     for profit, c, d, kind in pairs:
+        if c < 0:
+            # Stored energy: bounded by what is left at every later moment, so
+            # the house never loses what the baseline gave it.
+            x = min(export_room[d] - used_export[d], max(0.0, min(ends_work[d:])))
+            if x <= EPSILON:
+                continue
+            used_export[d] += x
+            for j in range(d, count):
+                ends_work[j] -= x
+            linked.append((c, d, x, profit * x / eta, KIND_EXPORT))
+            continue
         target_left = (
             unserved[d] - used_house[d]
             if kind == KIND_HOUSEHOLD
@@ -469,7 +550,8 @@ def plan_arbitrage(
     # Drop noise. Removing a purchase only lowers levels, so what is left stays
     # within every constraint above.
     kept = [i for i in range(count) if bought[i] >= MIN_ALLOCATION_KWH]
-    if not kept:
+    stock_entries = [e for e in linked if e[0] < 0 and e[2] >= MIN_STOCK_SALE_KWH]
+    if not kept and not stock_entries:
         return ArbitragePlan(
             status=STATUS_NOTHING_PROFITABLE,
             reason=REASON_NO_ROOM if linked else REASON_NO_SPREAD,
@@ -479,7 +561,7 @@ def plan_arbitrage(
             committed_charge_kwh=committed,
         )
     kept_set = set(kept)
-    final = [entry for entry in linked if entry[0] in kept_set]
+    final = [entry for entry in linked if entry[0] in kept_set] + stock_entries
     charges = tuple(
         ArbitrageCharge(
             start=future[i].start,
@@ -493,9 +575,11 @@ def plan_arbitrage(
     )
     pair_records = tuple(
         ArbitragePair(
-            charge_start=future[c].start,
+            # A stock sale has no purchase before it: the "charge" is the later
+            # refill, shown at its price and anchored on the sale itself.
+            charge_start=future[d].start if c < 0 else future[c].start,
             discharge_start=future[d].start,
-            charge_price=future[c].price,
+            charge_price=stock_price if c < 0 else future[c].price,
             discharge_price=(
                 future[d].price if kind == KIND_HOUSEHOLD else float(future[d].export_price)
             ),
@@ -507,11 +591,14 @@ def plan_arbitrage(
     )
     use_house = [0.0] * count
     use_export = [0.0] * count
-    for _c, d, x, _gain, kind in final:
+    use_stock = [0.0] * count
+    for c, d, x, _gain, kind in final:
         if kind == KIND_HOUSEHOLD:
             use_house[d] += x
         else:
             use_export[d] += x
+            if c < 0:
+                use_stock[d] += x
     discharges = []
     for i in range(count):
         if use_house[i] > EPSILON:
@@ -534,6 +621,7 @@ def plan_arbitrage(
                     stored_kwh=use_export[i],
                     kind=KIND_EXPORT,
                     delivered_kwh=use_export[i] * eta,
+                    stock_kwh=use_stock[i],
                 )
             )
     total_stored = sum(charge.stored_kwh for charge in charges)

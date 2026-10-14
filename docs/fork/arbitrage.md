@@ -31,7 +31,7 @@ Turn on **Sell extra arbitrage energy** (`switch.omnibattery_arbitrage_export`, 
 - **Value of a sale:** `round-trip efficiency × export price − buy price − wear cost`, and it has to reach the minimum margin, exactly like a household trade. The export price comes from the price layer (`get_future_export_price_slots`): tax, netting and any Zonneplan bonus are decided there, never here. Without a separate export price sensor the export price is the import price (net metering).
 - **Household first:** on equal value the house wins. A sale only gets the discharge power the house leaves over.
 - **Power is never hardcoded.** Buying is limited by the fleet's maximum charge power (and peak shaving), selling by its maximum discharge power. There is no separate grid export limit.
-- **Only extra energy is planned for sale.** Energy already in the battery stays the house's.
+- **Stored energy can be sold too.** After the house has had everything it needs until the end of the horizon, whatever is left in the battery may be sold in the dear hours, if it can be bought back later at the cheapest hours of the published price curve (priced on enough hours to refill it at your charge power) and the trade still clears wear and margin. This is what keeps a plan alive after the extra energy has been bought and the battery is full: there is nothing left to buy, but there is energy to sell.
 - **How the sale actually happens:** the plan hands a request to the High-Price Sale machinery. That releases the energy only when it is really in the battery, only beyond the demand protected until sunrise, never below the floor and never above the battery's power. A request made before the purchase simply finds nothing to sell yet and is picked up at the next rebuild (every five minutes).
 - **The discharge reserve holds the energy** for the planned sale hours, otherwise the house would use it before the peak.
 - **Not tied to the High-Price Sale select.** Arbitrage selling switches the sale machinery on by itself, so that select can stay Off.
@@ -86,7 +86,7 @@ content: |-
     'balanced': '⚖️ idle'
   } %}
   {% if st == 'planned' %}
-  ## ✅ Buying {{ state_attr(p, 'total_grid_kwh') }} kWh cheap{{ ' to sell' if state_attr(p, 'export_kwh') | float(0) > 0 else '' }} · +€{{ state_attr(p, 'expected_gain') | float(0) | round(2) }}
+  ## ✅ {% if state_attr(p, 'total_grid_kwh') | float(0) > 0 %}Buying {{ state_attr(p, 'total_grid_kwh') }} kWh cheap{{ ' to sell' if state_attr(p, 'export_kwh') | float(0) > 0 else '' }}{% else %}Selling {{ state_attr(p, 'export_kwh') }} kWh of stored energy{% endif %} · +€{{ state_attr(p, 'expected_gain') | float(0) | round(2) }}
   {% elif st == 'disabled' %}
   ## ⏸ Arbitrage off
   {% else %}

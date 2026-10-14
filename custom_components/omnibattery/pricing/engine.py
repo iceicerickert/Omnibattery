@@ -1698,6 +1698,20 @@ class PricingManager:
             demand, surplus = {}, {}
         ceiling = controller.max_price_threshold
         export_prices = self._arbitrage_export_prices(horizon, horizon_end)
+        refill_slots: list = []
+        if self._arbitrage_export_enabled():
+            # The whole published curve, past the horizon: stored energy that is
+            # sold now is bought back at the cheapest hours still to come.
+            try:
+                published = self.get_future_price_slots(horizon_end=now + timedelta(days=3))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Arbitrage: refill prices unavailable: %s", err)
+                published = []
+            refill_slots = [
+                ArbitrageSlot(start=slot.start, end=slot.end, price=slot.price)
+                for slot in published
+                if slot.end > now and math.isfinite(float(slot.price))
+            ]
         planner_slots = [
             ArbitrageSlot(
                 start=slot.start,
@@ -1738,6 +1752,7 @@ class PricingManager:
             min_margin=margin,
             max_charge_price=ceiling,
             allow_export=self._arbitrage_export_enabled(),
+            refill_slots=refill_slots,
         )
 
     def _arbitrage_committed_kwh(self, schedule, now: datetime) -> float:

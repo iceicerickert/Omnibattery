@@ -298,6 +298,18 @@ def format_arbitrage_lines(plan, *, unit: str) -> str:
     if not getattr(plan, "planned", False):
         reason = _ARBITRAGE_REASONS.get(plan.reason, plan.reason)
         return f"🔁 Arbitrage: nothing planned ({reason})\n"
+    if not plan.charges:
+        # Nothing to buy: the plan only sells energy already in the battery and
+        # buys it back later.
+        sold = sum(d.delivered_kwh for d in plan.discharges)
+        first = min(plan.discharges, key=lambda d: d.start)
+        last = max(plan.discharges, key=lambda d: d.end)
+        return (
+            f"🔁 Arbitrage: sell {sold:.2f} kWh of stored energy "
+            f"{first.start.strftime('%H:%M')}-{last.end.strftime('%H:%M')} "
+            f"at avg {plan.average_value_price:.4f} {unit}, to be bought back later\n"
+            f"   Expected gain after losses and wear: ~{plan.expected_gain:.2f} {cost_unit}\n"
+        )
     first = min(plan.discharges, key=lambda d: d.start) if plan.discharges else None
     last = max(plan.discharges, key=lambda d: d.end) if plan.discharges else None
     use = (
