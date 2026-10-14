@@ -24,6 +24,7 @@ from custom_components.omnibattery.control.high_price_discharge import (
     HighPriceDischargeManager,
 )
 from custom_components.omnibattery.pricing import PriceSlot, notifications
+from custom_components.omnibattery.pricing.engine import PricingManager
 from custom_components.omnibattery.pricing.arbitrage import (
     KIND_EXPORT,
     ArbitrageSlot,
@@ -666,3 +667,51 @@ def test_a_sale_only_plan_is_reported_and_notified_without_a_purchase():
     json.dumps(info)
     text = notifications.format_arbitrage_lines(ctrl._dp_last_arbitrage_plan, unit="€/kWh")
     assert "stored energy" in text and "bought back" in text
+
+
+# ---------------------------------------------------------------------------
+# The planner follows the sale's rule (floor and margin come from the setup)
+# ---------------------------------------------------------------------------
+
+
+def test_the_sale_reserve_comes_from_the_floors_and_the_safety_margin():
+    ctrl = _export_controller([_Battery("b1", 50, 10, min_soc=5), _Battery("b2", 50, 20, min_soc=5)])
+    ctrl._predictive_min_soc_floor_enabled = True
+    ctrl._predictive_min_soc_floor = 20.0
+    ctrl.predischarge_reserve_soc = 0.0
+    ctrl._predictive_safety_margin_kwh = 0.7
+    manager = PricingManager(SimpleNamespace(), ctrl)
+    floor_kwh, margin_kwh = manager._arbitrage_sale_reserve()
+    assert floor_kwh == pytest.approx(0.15 * 10 + 0.15 * 20)
+    assert margin_kwh == pytest.approx(0.7)
+
+
+def test_the_largest_of_the_floors_wins():
+    ctrl = _export_controller([_Battery("b1", 50, 10, min_soc=5)])
+    ctrl._predictive_min_soc_floor_enabled = False
+    ctrl.predischarge_reserve_soc = 30.0
+    manager = PricingManager(SimpleNamespace(), ctrl)
+    assert manager._arbitrage_sale_reserve()[0] == pytest.approx(0.25 * 10)
+    ctrl.predischarge_reserve_soc = 0.0
+    assert manager._arbitrage_sale_reserve()[0] == 0.0
+
+
+def test_a_missing_margin_or_an_unreadable_battery_gives_a_zero_reserve():
+    ctrl = _export_controller([_Battery("b1", 50, 10, available=False)])
+    manager = PricingManager(SimpleNamespace(), ctrl)
+    assert manager._arbitrage_sale_reserve() == (0.0, 0.0)
+
+
+def test_the_engine_plans_less_when_the_sale_floor_and_margin_are_higher():
+    slots = _future_slots(DEAR_THEN_CHEAP)
+    results = []
+    for floor_enabled, margin in ((False, 0.0), (True, 1.0)):
+        ctrl = _full_battery_controller()
+        ctrl._predictive_min_soc_floor_enabled = floor_enabled
+        ctrl._predictive_min_soc_floor = 30.0
+        ctrl._predictive_safety_margin_kwh = margin
+        manager = _manager(ctrl, slots)
+        _with_export_curve(manager, slots)
+        asyncio.run(manager._evaluate_dynamic_pricing(horizon=_daily()))
+        results.append(ctrl._dp_last_arbitrage_plan.export_kwh)
+    assert results[0] > results[1]

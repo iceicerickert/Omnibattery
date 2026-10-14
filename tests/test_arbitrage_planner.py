@@ -784,3 +784,146 @@ def test_stock_and_purchases_share_the_export_slots_without_exceeding_them():
         per_slot[d.start] = per_slot.get(d.start, 0.0) + d.delivered_kwh
     assert all(v <= 2.0 + 1e-9 for v in per_slot.values())
     assert plan.total_stored_kwh <= 4.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Following the sale's own rule
+# ---------------------------------------------------------------------------
+#
+# The sale planner releases   usable x RTE - protected demand - safety margin,
+# where usable is counted above the sale floor. A plan that promises more than
+# that is a plan that will not happen, so the planner is told the rule.
+
+
+def _evening(n=24):
+    slots = []
+    for i in range(n):
+        start = DAY + timedelta(hours=17, minutes=15 * i)
+        slots.append(
+            ArbitrageSlot(
+                start, start + timedelta(minutes=15), 0.50,
+                net_demand_kwh=0.6 if i < 8 else 0.0,
+                chargeable=False, export_price=0.50, ref=i,
+            )
+        )
+    return slots
+
+
+def _refill_night():
+    return [
+        ArbitrageSlot(DAY + timedelta(hours=26 + h), DAY + timedelta(hours=27 + h), 0.25)
+        for h in range(12)
+    ]
+
+
+def _delivered(plan):
+    return sum(d.delivered_kwh for d in plan.exports)
+
+
+def _ceiling_from_sale_rule(level, protected_ac, floor, margin, rte=0.88):
+    return rte * (level - floor) - protected_ac - margin
+
+
+def test_a_sale_never_exceeds_what_the_sale_rule_would_release():
+    # The numbers of a real afternoon: 14.7 kWh pack, 13.8 kWh above the 5%
+    # minimum, a 20% floor (2.2 kWh above it), 0.7 kWh margin, RTE 0.88.
+    slots = _evening()
+    protected_ac = 8 * 0.6  # AC kWh the house still needs
+    plan = _plan(
+        slots, allow_export=True, usable_energy_kwh=13.8, free_space_kwh=0.17,
+        refill_slots=_refill_night(), round_trip_efficiency=0.88,
+        discharge_power_kw=3.5, charge_power_kw=3.5,
+        export_floor_kwh=2.2, export_margin_kwh=0.7, follow_sale_rule=True,
+    )
+    ceiling = _ceiling_from_sale_rule(13.8, protected_ac, 2.2, 0.7)
+    assert plan.planned
+    assert _delivered(plan) <= ceiling + 1e-6
+    # And it is not needlessly timid: it uses most of what the rule allows.
+    assert _delivered(plan) >= 0.8 * ceiling
+
+
+def test_without_the_rule_the_same_plan_sells_much_more():
+    slots = _evening()
+    kwargs = dict(
+        allow_export=True, usable_energy_kwh=13.8, free_space_kwh=0.17,
+        refill_slots=_refill_night(), round_trip_efficiency=0.88,
+        discharge_power_kw=3.5, charge_power_kw=3.5,
+        export_floor_kwh=2.2, export_margin_kwh=0.7,
+    )
+    aligned = _plan(slots, follow_sale_rule=True, **kwargs)
+    loose = _plan(slots, follow_sale_rule=False, **kwargs)
+    assert _delivered(loose) > _delivered(aligned) + 2.0
+
+
+def test_a_higher_floor_or_margin_sells_less():
+    slots = _evening()
+    base = dict(
+        allow_export=True, usable_energy_kwh=13.8, free_space_kwh=0.17,
+        refill_slots=_refill_night(), round_trip_efficiency=0.88,
+        discharge_power_kw=3.5, charge_power_kw=3.5, follow_sale_rule=True,
+    )
+    low = _delivered(_plan(slots, export_floor_kwh=0.0, export_margin_kwh=0.0, **base))
+    mid = _delivered(_plan(slots, export_floor_kwh=2.2, export_margin_kwh=0.0, **base))
+    high = _delivered(_plan(slots, export_floor_kwh=2.2, export_margin_kwh=1.5, **base))
+    assert low > mid > high
+
+
+def test_a_nearly_empty_battery_sells_nothing_it_may_not():
+    slots = _evening()
+    plan = _plan(
+        slots, allow_export=True, usable_energy_kwh=3.0, free_space_kwh=11.0,
+        refill_slots=_refill_night(), round_trip_efficiency=0.88,
+        export_floor_kwh=2.2, export_margin_kwh=0.7, follow_sale_rule=True,
+        charge_power_kw=3.5, discharge_power_kw=3.5,
+    )
+    assert _delivered(plan) <= max(
+        0.0, _ceiling_from_sale_rule(3.0, 4.8, 2.2, 0.7)
+    ) + 1e-6
+
+
+def test_energy_bought_for_sale_first_covers_what_the_sale_must_leave():
+    # Battery empty, 6 kWh coming for the household, dear evening to sell into.
+    # Whatever is bought to sell has to make up the difference to the floor and
+    # margin first: the part that cannot be released stays in the battery.
+    cheap = [
+        ArbitrageSlot(DAY + timedelta(hours=11 + h), DAY + timedelta(hours=12 + h), 0.25, chargeable=True)
+        for h in range(4)
+    ]
+    slots = cheap + _evening()
+    kwargs = dict(
+        allow_export=True, usable_energy_kwh=0.0, free_space_kwh=14.0,
+        committed_charge_kwh=6.0, round_trip_efficiency=0.88,
+        export_floor_kwh=2.2, export_margin_kwh=0.7, follow_sale_rule=True,
+        charge_power_kw=3.5, discharge_power_kw=3.5,
+    )
+    aligned = _plan(slots, **kwargs)
+    kwargs["follow_sale_rule"] = False
+    loose = _plan(slots, **kwargs)
+    if loose.planned:
+        assert aligned.export_kwh <= loose.export_kwh + 1e-9
+        assert aligned.expected_gain <= loose.expected_gain + 1e-9
+    if aligned.planned:
+        bought = aligned.total_stored_kwh
+        assert aligned.export_kwh <= bought + 1e-9
+
+
+def test_the_sale_rule_is_off_unless_asked_for():
+    slots = _evening()
+    kwargs = dict(
+        allow_export=True, usable_energy_kwh=13.8, free_space_kwh=0.17,
+        refill_slots=_refill_night(), round_trip_efficiency=0.88,
+        export_floor_kwh=2.2, export_margin_kwh=0.7,
+    )
+    assert _delivered(_plan(slots, **kwargs)) == pytest.approx(
+        _delivered(_plan(slots, follow_sale_rule=False, **kwargs))
+    )
+
+
+def test_a_non_finite_sale_rule_input_is_ignored_not_trusted():
+    slots = _evening()
+    plan = _plan(
+        slots, allow_export=True, usable_energy_kwh=13.8, free_space_kwh=0.17,
+        refill_slots=_refill_night(), follow_sale_rule=True,
+        export_floor_kwh=float("nan"), export_margin_kwh=0.7,
+    )
+    assert plan.status in {STATUS_PLANNED, STATUS_NOTHING_PROFITABLE, STATUS_INVALID}

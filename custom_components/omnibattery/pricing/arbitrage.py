@@ -295,6 +295,9 @@ def plan_arbitrage(
     max_charge_price: float | None = None,
     allow_export: bool = False,
     refill_slots: Sequence[ArbitrageSlot] = (),
+    export_floor_kwh: float = 0.0,
+    export_margin_kwh: float = 0.0,
+    follow_sale_rule: bool = False,
 ) -> ArbitragePlan:
     """Plan extra grid purchases that pay for themselves later.
 
@@ -338,6 +341,28 @@ def plan_arbitrage(
     free = _positive(free_space_kwh)
     committed = _positive(committed_charge_kwh)
     cap = usable + free
+    # What a sale must leave in the battery, in the units of this model. The sale
+    # planner only releases ``usable x RTE - protected demand - safety margin``,
+    # where usable is counted above a higher floor than the household's and
+    # discounted by the full round trip rather than the one-way efficiency. This
+    # is that rule rewritten for stored kWh at the largest level the battery can
+    # hold, so a plan never promises a sale the safe rule would refuse.
+    export_reserve = 0.0
+    if (
+        allow_export
+        and follow_sale_rule
+        and _finite(export_floor_kwh)
+        and _finite(export_margin_kwh)
+    ):
+        export_reserve = max(
+            0.0,
+            (
+                (eta - rte) * cap
+                + rte * _positive(export_floor_kwh)
+                + _positive(export_margin_kwh)
+            )
+            / eta,
+        )
     if cap <= EPSILON:
         return ArbitragePlan(
             status=STATUS_NOTHING_PROFITABLE,
@@ -432,7 +457,9 @@ def plan_arbitrage(
     stock_price: float | None = None
     if allow_export and refill_slots and export_total > EPSILON:
         sale_indexes = [i for i in range(count) if export_room[i] > EPSILON]
-        stock_cap = max((min(ends[i:]) for i in sale_indexes), default=0.0)
+        stock_cap = max(
+            (min(ends[i:]) - export_reserve for i in sale_indexes), default=0.0
+        )
         if stock_cap > EPSILON:
             stock_price = _refill_price(
                 refill_slots,
@@ -519,7 +546,10 @@ def plan_arbitrage(
         if c < 0:
             # Stored energy: bounded by what is left at every later moment, so
             # the house never loses what the baseline gave it.
-            x = min(export_room[d] - used_export[d], max(0.0, min(ends_work[d:])))
+            x = min(
+                export_room[d] - used_export[d],
+                max(0.0, min(ends_work[d:]) - export_reserve),
+            )
             if x <= EPSILON:
                 continue
             used_export[d] += x
@@ -546,6 +576,29 @@ def plan_arbitrage(
         for j in range(c, d + 1):
             room[j] -= x
         linked.append((c, d, x, profit * x / eta, kind))
+
+    # If the battery, after the household and any stored sale, would sit below
+    # what a sale has to leave, the energy bought for sale must first make up the
+    # difference: that part stays in the battery and is not sold. The purchase is
+    # not undone, so it is charged against the gain as a sunk cost.
+    shortfall = max(0.0, export_reserve - min(ends_work)) if export_reserve > EPSILON else 0.0
+    if shortfall > EPSILON:
+        bought_exports = sorted(
+            (i for i, e in enumerate(linked) if e[0] >= 0 and e[4] == KIND_EXPORT),
+            key=lambda i: linked[i][3] / max(linked[i][2], EPSILON),
+        )
+        for i in bought_exports:
+            if shortfall <= EPSILON:
+                break
+            c, d, x, gain, kind = linked[i]
+            cut = min(x, shortfall)
+            kept_x = x - cut
+            kept_gain = gain * kept_x / x if x > EPSILON else 0.0
+            sunk = future[c].price * cut / eta
+            linked[i] = (c, d, kept_x, kept_gain - sunk, kind)
+            used_export[d] -= cut
+            shortfall -= cut
+        linked = [e for e in linked if e[2] > EPSILON]
 
     # Drop noise. Removing a purchase only lowers levels, so what is left stays
     # within every constraint above.

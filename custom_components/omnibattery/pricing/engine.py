@@ -1629,6 +1629,43 @@ class PricingManager:
             free += max(0.0, capacity * (ceiling - soc) / 100.0)
         return (usable, free) if readable else None
 
+    def _arbitrage_sale_reserve(self) -> tuple[float, float]:
+        """Return ``(floor_kwh, margin_kwh)`` a planned sale has to leave behind.
+
+        The sale planner counts usable energy above the highest of the minimum
+        SOC, the guaranteed minimum SOC and the pre-discharge reserve, and keeps
+        a safety margin. ``floor_kwh`` is the part of that floor above the
+        household's own minimum, in battery kWh.
+        """
+        controller = self._controller
+        guaranteed = (
+            float(getattr(controller, "_predictive_min_soc_floor", 0.0) or 0.0)
+            if getattr(controller, "_predictive_min_soc_floor_enabled", False)
+            else 0.0
+        )
+        reserve = max(0.0, float(getattr(controller, "predischarge_reserve_soc", 0.0) or 0.0))
+        floor_kwh = 0.0
+        for coordinator in getattr(controller, "coordinators", []):
+            if not self._opportunistic_battery_eligible(coordinator):
+                continue
+            data = getattr(coordinator, "data", None) or {}
+            try:
+                capacity = float(data.get("battery_total_energy"))
+                minimum = float(coordinator.min_soc)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if not (math.isfinite(capacity) and math.isfinite(minimum)) or capacity <= 0:
+                continue
+            floor_pct = max(minimum, guaranteed, reserve)
+            floor_kwh += max(0.0, floor_pct - minimum) / 100.0 * capacity
+        try:
+            margin_kwh = max(
+                0.0, float(getattr(controller, "_predictive_safety_margin_kwh", 0.0) or 0.0)
+            )
+        except (TypeError, ValueError):
+            margin_kwh = 0.0
+        return floor_kwh, margin_kwh
+
     def _arbitrage_slot_authorised(self, slot: PriceSlot) -> bool:
         """Return whether an arbitrage slot may still charge at this instant."""
         if not self._arbitrage_feature_enabled():
@@ -1739,6 +1776,7 @@ class PricingManager:
             / 1000.0
         )
         discharge_kw = max(0.0, float(controller.max_discharge_capacity or 0.0)) / 1000.0
+        sale_floor_kwh, sale_margin_kwh = self._arbitrage_sale_reserve()
         return plan_arbitrage(
             planner_slots,
             now=now,
@@ -1753,6 +1791,9 @@ class PricingManager:
             max_charge_price=ceiling,
             allow_export=self._arbitrage_export_enabled(),
             refill_slots=refill_slots,
+            export_floor_kwh=sale_floor_kwh,
+            export_margin_kwh=sale_margin_kwh,
+            follow_sale_rule=True,
         )
 
     def _arbitrage_committed_kwh(self, schedule, now: datetime) -> float:
