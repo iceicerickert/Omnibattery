@@ -68,7 +68,7 @@ content: |-
   {%- set why = state_attr(pc, 'decision_reason') | string %}
   {%- set cause = 'weekly full charge' if 'Weekly' in why else 'forecast deficit' if 'deficit' in why else 'plan' %}
   {%- set usable = state_attr(dr, 'usable_energy_kwh') | float(0) %}
-  {%- set need = state_attr(dr, 'horizon_demand_kwh') | float(0) / (rte ** 0.5) %}
+  {%- set need = ([(state_attr(dr, 'horizon_demand_kwh') | float(0)) - (state_attr(p, 'export_kwh') | float(0)), 0] | max) / (rte ** 0.5) %}
   {%- set left = usable + committed - need %}
   {%- set known = state_attr(dr, 'reason') != 'no_usable_energy' %}
   {%- set texts = {
