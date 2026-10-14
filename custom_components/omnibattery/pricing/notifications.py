@@ -306,9 +306,29 @@ def format_arbitrage_lines(plan, *, unit: str) -> str:
         if first is not None and plan.average_value_price is not None
         else ""
     )
+    exports = [d for d in plan.discharges if getattr(d, "kind", "household") == "export"]
+    sale = ""
+    if exports:
+        sold = sum(d.delivered_kwh for d in exports)
+        first = min(exports, key=lambda d: d.start)
+        last = max(exports, key=lambda d: d.end)
+        average = sum(d.price * d.stored_kwh for d in exports) / sum(d.stored_kwh for d in exports)
+        sale = (
+            f"   Sell {sold:.2f} kWh {first.start.strftime('%H:%M')}-{last.end.strftime('%H:%M')} "
+            f"at avg {average:.4f} {unit}\n"
+        )
+        # The household part is whatever else the plan counts on.
+        use = ""
+        households = [d for d in plan.discharges if getattr(d, "kind", "household") != "export"]
+        if households:
+            use = (
+                f", used {min(h.start for h in households).strftime('%H:%M')}-"
+                f"{max(h.end for h in households).strftime('%H:%M')} at home"
+            )
     return (
         f"🔁 Arbitrage: buy {plan.total_grid_kwh:.2f} kWh from the grid at avg "
         f"{plan.average_charge_price:.4f} {unit}{use}\n"
+        f"{sale}"
         f"   Expected gain after losses and wear: ~{plan.expected_gain:.2f} {cost_unit}\n"
     )
 

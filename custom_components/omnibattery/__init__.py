@@ -169,6 +169,8 @@ from .const import (
     DEFAULT_ARBITRAGE_CHARGING_ENABLED,
     CONF_ARBITRAGE_WEAR_COST,
     DEFAULT_ARBITRAGE_WEAR_COST,
+    CONF_ARBITRAGE_EXPORT_ENABLED,
+    DEFAULT_ARBITRAGE_EXPORT_ENABLED,
     CONF_DISCHARGE_RESERVE_ENABLED,
     CONF_DISCHARGE_RESERVE_MIN_SAVING,
     DEFAULT_DISCHARGE_RESERVE_ENABLED,
@@ -1058,6 +1060,9 @@ class ChargeDischargeController:
         )
         self.arbitrage_wear_cost = config_entry.data.get(
             CONF_ARBITRAGE_WEAR_COST, DEFAULT_ARBITRAGE_WEAR_COST
+        )
+        self.arbitrage_export_enabled = config_entry.data.get(
+            CONF_ARBITRAGE_EXPORT_ENABLED, DEFAULT_ARBITRAGE_EXPORT_ENABLED
         )
         self.surplus_price_hold_enabled = config_entry.data.get(
             CONF_SURPLUS_PRICE_HOLD_ENABLED, DEFAULT_SURPLUS_PRICE_HOLD_ENABLED
@@ -2910,6 +2915,7 @@ class ChargeDischargeController:
         old_negative_price_enabled = self.negative_price_charging_enabled
         old_arbitrage_config = (
             self.arbitrage_charging_enabled,
+            self.arbitrage_export_enabled,
             self.arbitrage_wear_cost,
             self.min_arbitrage_margin,
             self.round_trip_efficiency,
@@ -3035,8 +3041,12 @@ class ChargeDischargeController:
         self.arbitrage_wear_cost = self.config_entry.data.get(
             CONF_ARBITRAGE_WEAR_COST, DEFAULT_ARBITRAGE_WEAR_COST
         )
+        self.arbitrage_export_enabled = self.config_entry.data.get(
+            CONF_ARBITRAGE_EXPORT_ENABLED, DEFAULT_ARBITRAGE_EXPORT_ENABLED
+        )
         new_arbitrage_config = (
             self.arbitrage_charging_enabled,
+            self.arbitrage_export_enabled,
             self.arbitrage_wear_cost,
             self.min_arbitrage_margin,
             self.round_trip_efficiency,

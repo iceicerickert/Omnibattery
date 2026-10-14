@@ -513,6 +513,9 @@ def _dynamic_pricing_info(controller) -> dict[str, Any]:
             controller, "arbitrage_charging_enabled", False
         ),
         "arbitrage_wear_cost": getattr(controller, "arbitrage_wear_cost", None),
+        "arbitrage_export_enabled": getattr(
+            controller, "arbitrage_export_enabled", False
+        ),
         "negative_price_charging_enabled": getattr(
             controller, "negative_price_charging_enabled", False
         ),

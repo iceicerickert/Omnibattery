@@ -1503,6 +1503,42 @@ class PricingManager:
             == PREDICTIVE_MODE_DYNAMIC_PRICING
         )
 
+    def _arbitrage_export_enabled(self) -> bool:
+        """Return whether extra energy may also be bought to be sold."""
+        return bool(
+            self._arbitrage_feature_enabled()
+            and getattr(self._controller, "arbitrage_export_enabled", False)
+        )
+
+    def _arbitrage_export_prices(self, horizon: list, horizon_end: datetime) -> dict:
+        """Map each price slot to what exporting in it pays, never above the curve.
+
+        The export curve is the price layer's: it already carries tax, netting
+        and any bonus. Where its slots do not line up with the import slots the
+        lowest overlapping price is taken, so a sale is never planned on an
+        averaged-away spike. A slot with no export price is simply not sold in.
+        """
+        if not self._arbitrage_export_enabled():
+            return {}
+        try:
+            export_slots = self.get_future_export_price_slots(horizon_end=horizon_end)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Arbitrage: export prices unavailable, no sale planned: %s", err)
+            return {}
+        prices: dict = {}
+        for slot in horizon:
+            overlapping = [
+                float(other.price)
+                for other in export_slots
+                if other.start < slot.end
+                and slot.start < other.end
+                and other.price is not None
+                and math.isfinite(float(other.price))
+            ]
+            if overlapping:
+                prices[slot] = min(overlapping)
+        return prices
+
     def _arbitrage_discharge_hold_active(self) -> bool:
         """Return whether something stops the house burning bought energy early.
 
@@ -1618,6 +1654,7 @@ class PricingManager:
             _LOGGER.warning("Arbitrage: demand forecast failed, planning nothing: %s", err)
             demand, surplus = {}, {}
         ceiling = controller.max_price_threshold
+        export_prices = self._arbitrage_export_prices(horizon, horizon_end)
         planner_slots = [
             ArbitrageSlot(
                 start=slot.start,
@@ -1627,6 +1664,7 @@ class PricingManager:
                 expected_surplus_kwh=surplus.get(slot, 0.0),
                 chargeable=slot not in taken,
                 ref=slot,
+                export_price=export_prices.get(slot),
             )
             for slot in horizon
         ]
@@ -1656,6 +1694,7 @@ class PricingManager:
             wear_cost=wear,
             min_margin=margin,
             max_charge_price=ceiling,
+            allow_export=self._arbitrage_export_enabled(),
         )
 
     def _arbitrage_committed_kwh(self, schedule, now: datetime) -> float:
@@ -1956,10 +1995,11 @@ class PricingManager:
             "enabled": bool(getattr(controller, "arbitrage_charging_enabled", False)),
             "active": bool(enabled),
             "discharge_hold_active": self._arbitrage_discharge_hold_active(),
+            "export_enabled": bool(getattr(controller, "arbitrage_export_enabled", False)),
             "wear_cost": getattr(controller, "arbitrage_wear_cost", 0.0),
         }
         if plan is None:
-            info.update(status="no_plan", reason=None, charges=[], discharges=[])
+            info.update(status="no_plan", reason=None, charges=[], discharges=[], export_kwh=0.0)
             return info
         slot_kwh = getattr(schedule, "slot_arbitrage_kwh", {}) if schedule else {}
         info.update(
@@ -1989,9 +2029,12 @@ class PricingManager:
                     "end": discharge.end.isoformat(),
                     "price": discharge.price,
                     "stored_kwh": round(discharge.stored_kwh, 3),
+                    "delivered_kwh": round(discharge.delivered_kwh, 3),
+                    "kind": discharge.kind,
                 }
                 for discharge in plan.discharges
             ],
+            export_kwh=round(sum(d.delivered_kwh for d in plan.exports), 3),
         )
         return info
 

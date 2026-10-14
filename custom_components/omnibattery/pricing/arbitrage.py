@@ -109,6 +109,10 @@ class ArbitrageSlot:
     expected_surplus_kwh: float = 0.0
     chargeable: bool = True
     ref: Any = None
+    # What exporting to the grid pays in this slot, or None when it must not be
+    # planned (no export curve, or the caller did not allow export). The price
+    # layer owns tax, bonus and netting; this module only compares numbers.
+    export_price: float | None = None
 
     @property
     def duration_hours(self) -> float:
@@ -127,14 +131,21 @@ class ArbitrageCharge:
     ref: Any = None
 
 
+KIND_HOUSEHOLD = "household"
+KIND_EXPORT = "export"
+
+
 @dataclass(frozen=True)
 class ArbitrageDischarge:
-    """The later demand a plan is counting on, for explanation and the card."""
+    """What a plan counts on later: household demand it replaces, or an export."""
 
     start: datetime
     end: datetime
     price: float
     stored_kwh: float
+    kind: str = KIND_HOUSEHOLD
+    # Energy that leaves the battery for the house or the grid, after losses.
+    delivered_kwh: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -147,6 +158,7 @@ class ArbitragePair:
     discharge_price: float
     stored_kwh: float
     gain: float
+    kind: str = KIND_HOUSEHOLD
 
 
 @dataclass(frozen=True)
@@ -171,6 +183,15 @@ class ArbitragePlan:
     @property
     def planned(self) -> bool:
         return self.status == STATUS_PLANNED and bool(self.charges)
+
+    @property
+    def exports(self) -> tuple[ArbitrageDischarge, ...]:
+        """The planned sales: energy bought extra to be exported later."""
+        return tuple(d for d in self.discharges if d.kind == KIND_EXPORT)
+
+    @property
+    def export_kwh(self) -> float:
+        return sum(d.stored_kwh for d in self.exports)
 
     def stored_kwh_for(self, ref: Any) -> float:
         for charge in self.charges:
@@ -231,6 +252,7 @@ def plan_arbitrage(
     wear_cost: float = 0.0,
     min_margin: float = 0.0,
     max_charge_price: float | None = None,
+    allow_export: bool = False,
 ) -> ArbitragePlan:
     """Plan extra grid purchases that pay for themselves later.
 
@@ -325,6 +347,18 @@ def plan_arbitrage(
         for slot in future
     ]
     pv = [_positive(slot.expected_surplus_kwh) for slot in future]
+    # What the battery can still push out in a slot once the household has had
+    # its share of the same discharge power. Only extra bought energy is ever
+    # planned for it; energy already stored is never counted as a sale here.
+    export_room = [
+        max(0.0, discharge_kw * slot.duration_hours / eta - demand[i])
+        if allow_export
+        and slot.export_price is not None
+        and _finite(slot.export_price)
+        and float(slot.export_price) > 0.0
+        else 0.0
+        for i, slot in enumerate(future)
+    ]
 
     level0 = min(cap, usable + committed)
     zeros = [0.0] * count
@@ -346,6 +380,7 @@ def plan_arbitrage(
     mids, _ends, _lost = _simulate(level0, cap, pv, zeros, baseline_out)
     unserved = [max(0.0, demand[i] - baseline_out[i]) for i in range(count)]
     unserved_total = sum(unserved)
+    export_total = sum(export_room)
 
     if sum(charge_room) <= EPSILON:
         return ArbitragePlan(
@@ -356,7 +391,7 @@ def plan_arbitrage(
             room_kwh=max(0.0, cap - level0),
             committed_charge_kwh=committed,
         )
-    if unserved_total <= EPSILON:
+    if unserved_total + export_total <= EPSILON:
         return ArbitragePlan(
             status=STATUS_NOTHING_PROFITABLE,
             reason=REASON_NO_DEMAND,
@@ -365,24 +400,28 @@ def plan_arbitrage(
             committed_charge_kwh=committed,
         )
 
-    # Candidate pairs, best first. A purchase must end before its use starts.
-    pairs: list[tuple[float, int, int]] = []
+    # Candidate pairs, best first. A purchase must end before its use starts, and
+    # a use is either household demand (worth the import price it avoids) or an
+    # export (worth the export price).
+    pairs: list[tuple[float, int, int, str]] = []
     for c in range(count):
         if charge_room[c] <= EPSILON:
             continue
         for d in range(c + 1, count):
-            if unserved[d] <= EPSILON or future[d].start < future[c].end:
+            if future[d].start < future[c].end:
                 continue
-            if future[d].price <= 0.0:
+            if unserved[d] > EPSILON and future[d].price > 0.0:
                 # Not drawing from the grid at a non-positive price is no saving,
                 # and the discharge reserve never holds energy for such an hour.
-                continue
-            profit = profit_per_grid_kwh(
-                future[c].price, future[d].price, rte, wear
-            )
-            if profit <= EPSILON or profit < margin:
-                continue
-            pairs.append((profit, c, d))
+                profit = profit_per_grid_kwh(future[c].price, future[d].price, rte, wear)
+                if profit > EPSILON and profit >= margin:
+                    pairs.append((profit, c, d, KIND_HOUSEHOLD))
+            if export_room[d] > EPSILON:
+                profit = profit_per_grid_kwh(
+                    future[c].price, float(future[d].export_price), rte, wear
+                )
+                if profit > EPSILON and profit >= margin:
+                    pairs.append((profit, c, d, KIND_EXPORT))
     if not pairs:
         return ArbitragePlan(
             status=STATUS_NOTHING_PROFITABLE,
@@ -392,7 +431,10 @@ def plan_arbitrage(
             room_kwh=max(0.0, cap - level0),
             committed_charge_kwh=committed,
         )
-    pairs.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
+    # On a tie the household wins: it saves an import and needs no export.
+    pairs.sort(
+        key=lambda entry: (-entry[0], entry[1], entry[2], entry[3] != KIND_HOUSEHOLD)
+    )
 
     # Room per slot for added energy: a purchase held from slot c until it is
     # used in slot d raises the pre-discharge level in every slot of [c, d]. It
@@ -400,20 +442,29 @@ def plan_arbitrage(
     # never push out PV the baseline managed to store.
     room = [max(0.0, cap - mids[i]) for i in range(count)]
     bought = [0.0] * count
-    used = [0.0] * count
-    linked: list[tuple[int, int, float, float]] = []
-    for profit, c, d in pairs:
-        x = min(charge_room[c] - bought[c], unserved[d] - used[d])
+    used_house = [0.0] * count
+    used_export = [0.0] * count
+    linked: list[tuple[int, int, float, float, str]] = []
+    for profit, c, d, kind in pairs:
+        target_left = (
+            unserved[d] - used_house[d]
+            if kind == KIND_HOUSEHOLD
+            else export_room[d] - used_export[d]
+        )
+        x = min(charge_room[c] - bought[c], target_left)
         if x <= EPSILON:
             continue
         x = min(x, min(room[c : d + 1]))
         if x <= EPSILON:
             continue
         bought[c] += x
-        used[d] += x
+        if kind == KIND_HOUSEHOLD:
+            used_house[d] += x
+        else:
+            used_export[d] += x
         for j in range(c, d + 1):
             room[j] -= x
-        linked.append((c, d, x, profit * x / eta))
+        linked.append((c, d, x, profit * x / eta, kind))
 
     # Drop noise. Removing a purchase only lowers levels, so what is left stays
     # within every constraint above.
@@ -445,25 +496,46 @@ def plan_arbitrage(
             charge_start=future[c].start,
             discharge_start=future[d].start,
             charge_price=future[c].price,
-            discharge_price=future[d].price,
+            discharge_price=(
+                future[d].price if kind == KIND_HOUSEHOLD else float(future[d].export_price)
+            ),
             stored_kwh=x,
             gain=gain,
+            kind=kind,
         )
-        for c, d, x, gain in final
+        for c, d, x, gain, kind in final
     )
-    use = [0.0] * count
-    for _c, d, x, _gain in final:
-        use[d] += x
-    discharges = tuple(
-        ArbitrageDischarge(
-            start=future[i].start,
-            end=future[i].end,
-            price=future[i].price,
-            stored_kwh=use[i],
-        )
-        for i in range(count)
-        if use[i] > EPSILON
-    )
+    use_house = [0.0] * count
+    use_export = [0.0] * count
+    for _c, d, x, _gain, kind in final:
+        if kind == KIND_HOUSEHOLD:
+            use_house[d] += x
+        else:
+            use_export[d] += x
+    discharges = []
+    for i in range(count):
+        if use_house[i] > EPSILON:
+            discharges.append(
+                ArbitrageDischarge(
+                    start=future[i].start,
+                    end=future[i].end,
+                    price=future[i].price,
+                    stored_kwh=use_house[i],
+                    kind=KIND_HOUSEHOLD,
+                    delivered_kwh=use_house[i] * eta,
+                )
+            )
+        if use_export[i] > EPSILON:
+            discharges.append(
+                ArbitrageDischarge(
+                    start=future[i].start,
+                    end=future[i].end,
+                    price=float(future[i].export_price),
+                    stored_kwh=use_export[i],
+                    kind=KIND_EXPORT,
+                    delivered_kwh=use_export[i] * eta,
+                )
+            )
     total_stored = sum(charge.stored_kwh for charge in charges)
     value_weight = sum(entry[2] for entry in final)
     return ArbitragePlan(
@@ -471,7 +543,7 @@ def plan_arbitrage(
         reason=REASON_PLANNED,
         evaluation_time=now,
         charges=charges,
-        discharges=discharges,
+        discharges=tuple(discharges),
         pairs=pair_records,
         total_stored_kwh=total_stored,
         total_grid_kwh=sum(charge.grid_kwh for charge in charges),
@@ -482,7 +554,8 @@ def plan_arbitrage(
             else None
         ),
         average_value_price=(
-            sum(future[d].price * x for _c, d, x, _g in final) / value_weight
+            sum(record.discharge_price * record.stored_kwh for record in pair_records)
+            / value_weight
             if value_weight > EPSILON
             else None
         ),

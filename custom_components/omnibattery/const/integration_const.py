@@ -947,6 +947,11 @@ CONF_ARBITRAGE_CHARGING_ENABLED = "arbitrage_charging_enabled"
 DEFAULT_ARBITRAGE_CHARGING_ENABLED = False
 CONF_ARBITRAGE_WEAR_COST = "arbitrage_wear_cost"
 DEFAULT_ARBITRAGE_WEAR_COST = 0.0
+# Also buy extra energy to *sell* in the dear hours, not only to use at home. A
+# separate opt-in: it exports battery energy, which the other arbitrage mode
+# never does.
+CONF_ARBITRAGE_EXPORT_ENABLED = "arbitrage_export_enabled"
+DEFAULT_ARBITRAGE_EXPORT_ENABLED = False
 
 # Price-aware solar surplus absorption.  Storing surplus forfeits that slot's
 # feed-in revenue, so on a dynamic contract the same daily charge is cheaper

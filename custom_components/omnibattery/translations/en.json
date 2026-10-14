@@ -1419,6 +1419,9 @@
       "smart_predischarge": {
         "name": "Smart Pre-discharge / Anti-curtailment"
       },
+      "arbitrage_export": {
+        "name": "Sell extra arbitrage energy"
+      },
       "arbitrage_charging": {
         "name": "Price arbitrage charging"
       },

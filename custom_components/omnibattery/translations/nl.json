@@ -1503,6 +1503,9 @@
       "smart_predischarge": {
         "name": "Slim voorontladen / anti-afregeling"
       },
+      "arbitrage_export": {
+        "name": "Extra arbitrage-energie verkopen"
+      },
       "arbitrage_charging": {
         "name": "Laden op prijsverschil (arbitrage)"
       },

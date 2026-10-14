@@ -24,6 +24,19 @@ A pair is used only when that is positive and at least **Minimum Arbitrage Margi
 
 **Price arbitrage charging** needs the **Discharge Reserve** or **Price-Based Discharge**. Without one of them the house would use the cheap energy before the expensive hours, so no plan is made and the reason is shown in the notification and on the plan sensor.
 
+## Buying extra to sell (optional)
+
+Turn on **Sell extra arbitrage energy** (`switch.omnibattery_arbitrage_export`, needs *Price arbitrage charging*) and the planner also buys extra energy in cheap periods to **export** it in the dear ones, not only to use at home.
+
+- **Value of a sale:** `round-trip efficiency × export price − buy price − wear cost`, and it has to reach the minimum margin, exactly like a household trade. The export price comes from the price layer (`get_future_export_price_slots`): tax, netting and any Zonneplan bonus are decided there, never here. Without a separate export price sensor the export price is the import price (net metering).
+- **Household first:** on equal value the house wins. A sale only gets the discharge power the house leaves over.
+- **Power is never hardcoded.** Buying is limited by the fleet's maximum charge power (and peak shaving), selling by its maximum discharge power. There is no separate grid export limit.
+- **Only extra energy is planned for sale.** Energy already in the battery stays the house's.
+- **How the sale actually happens:** the plan hands a request to the High-Price Sale machinery. That releases the energy only when it is really in the battery, only beyond the demand protected until sunrise, never below the floor and never above the battery's power. A request made before the purchase simply finds nothing to sell yet and is picked up at the next rebuild (every five minutes).
+- **The discharge reserve holds the energy** for the planned sale hours, otherwise the house would use it before the peak.
+- **Not tied to the High-Price Sale select.** Arbitrage selling switches the sale machinery on by itself, so that select can stay Off.
+- The sale appears in the plan sensor (`discharges` with `kind: export`, `export_kwh`) and in the High-Price Sale status (`arbitrage_kwh`).
+
 **Arbitrage wear cost** is the cost of cycling the battery per grid kWh bought (default 0). It is deducted from every trade on top of the efficiency losses; the minimum margin is a threshold on top of that. Changing either re-plans immediately.
 
 Arbitrage periods carry the `arbitrage` purpose and their own energy per period. At the start of a period, the target SOC is the current SOC plus that period's planned energy (split across batteries by their remaining room), never the charge ceiling. About an hour before each arbitrage period it is re-planned from the live battery and the live remainder of the horizon, and dropped if it is no longer worth it, for example when solar has filled the battery. It is also re-planned with every normal plan rebuild, and **once an hour on its own** (an arbitrage-only refresh that adds slots that became worthwhile and withdraws future ones that stopped being so; deficit slots, a running slot and notifications are left alone). The refresh is skipped while a charge slot is running or the feature is off.
@@ -58,7 +71,7 @@ content: |-
   {%- set need = state_attr(dr, 'horizon_demand_kwh') | float(0) / (rte ** 0.5) %}
   {%- set left = usable + committed - need %}
   {%- set texts = {
-    'no_unserved_demand': 'battery + planned charge already cover the demand',
+    'no_unserved_demand': 'battery + planned charge already cover the demand' ~ ('' if state_attr(p, 'export_enabled') else ' (turn on selling to also trade the spread)'),
     'no_profitable_spread': 'price gap too small after losses, wear and margin',
     'needs_discharge_hold': 'turn on Discharge Reserve or Price-Based Discharge',
     'no_charge_slots': 'no free cheap slot to buy in',
@@ -72,7 +85,7 @@ content: |-
     'balanced': '⚖️ idle'
   } %}
   {% if st == 'planned' %}
-  ## ✅ Buying {{ state_attr(p, 'total_grid_kwh') }} kWh cheap · +€{{ state_attr(p, 'expected_gain') | float(0) | round(2) }}
+  ## ✅ Buying {{ state_attr(p, 'total_grid_kwh') }} kWh cheap{{ ' to sell' if state_attr(p, 'export_kwh') | float(0) > 0 else '' }} · +€{{ state_attr(p, 'expected_gain') | float(0) | round(2) }}
   {% elif st == 'disabled' %}
   ## ⏸ Arbitrage off
   {% else %}
@@ -81,6 +94,8 @@ content: |-
   {% endif %}
 
   {% if st != 'disabled' %}
+  _Selling extra: {{ 'on' if state_attr(p, 'export_enabled') else 'off' }}_
+
   | Energy until tomorrow's prices | |
   |---|--:|
   | Battery, usable now | {{ usable | round(1) }} kWh |
@@ -96,9 +111,9 @@ content: |-
   {% for c in a -%}
   - {{ as_timestamp(c.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(c.end) | timestamp_custom('%H:%M') }} · €{{ c.price | round(2) }} · {{ c.stored_kwh | round(1) }} kWh
   {% endfor %}
-  **Use:**
+  **Use / sell:**
   {% for x in d -%}
-  - {{ as_timestamp(x.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(x.end) | timestamp_custom('%H:%M') }} · €{{ x.price | round(2) }} · {{ x.stored_kwh | round(1) }} kWh
+  - {{ '💶 sell' if x.kind == 'export' else '🏠 home' }} {{ as_timestamp(x.start) | timestamp_custom('%H:%M') }}–{{ as_timestamp(x.end) | timestamp_custom('%H:%M') }} · €{{ x.price | round(2) }} · {{ (x.delivered_kwh if x.delivered_kwh is defined else x.stored_kwh) | round(1) }} kWh
   {% endfor %}
   {% endif %}
   ---

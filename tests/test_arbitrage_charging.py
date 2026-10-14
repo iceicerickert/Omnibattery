@@ -1156,6 +1156,7 @@ def _reload(old_enabled: bool, old_wear: float, data: dict):
     controller = MagicMock()
     controller.config_entry = SimpleNamespace(data=data, entry_id="entry", title="t")
     controller.arbitrage_charging_enabled = old_enabled
+    controller.arbitrage_export_enabled = False
     controller.arbitrage_wear_cost = old_wear
     controller.min_arbitrage_margin = None
     controller.round_trip_efficiency = DEFAULT_ROUND_TRIP_EFFICIENCY

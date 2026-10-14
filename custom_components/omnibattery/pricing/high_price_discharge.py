@@ -118,6 +118,21 @@ class DemandLink:
 
 
 @dataclass(frozen=True)
+class ArbitrageExport:
+    """Energy the arbitrage plan bought to be sold in this period.
+
+    ``energy_kwh`` is what leaves the battery for the grid (AC side, after
+    discharge losses). The request only says *when* and *how much*: whether it
+    may really be sold is decided here, against the energy actually in the
+    battery and the demand that is protected until sunrise.
+    """
+
+    start: datetime
+    end: datetime
+    energy_kwh: float
+
+
+@dataclass(frozen=True)
 class TriggerAllocation:
     """A sale in one slot, kWh for kWh linked to later household demand."""
 
@@ -130,6 +145,8 @@ class TriggerAllocation:
     demand_links: tuple[DemandLink, ...] = ()
     surplus_kwh: float = 0.0
     surplus_threshold: float | None = None
+    # Part of ``energy_kwh`` that arbitrage bought specifically to sell here.
+    arbitrage_kwh: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -157,6 +174,11 @@ class HighPriceDischargePlan:
             if allocation.start <= moment < allocation.end:
                 return allocation
         return None
+
+    @property
+    def arbitrage_kwh(self) -> float:
+        """Energy in this plan that arbitrage bought to sell."""
+        return sum(allocation.arbitrage_kwh for allocation in self.allocations)
 
     def remaining_kwh(self, moment: datetime) -> float:
         """Energy of the still-future allocations, for the live enforcer."""
@@ -357,6 +379,7 @@ def plan_high_price_discharge(
     safety_margin_kwh: float = 0.0,
     fill_slots: Sequence[HorizonSlot] = (),
     chronological_coverage: bool = True,
+    arbitrage_exports: Sequence[ArbitrageExport] = (),
 ) -> HighPriceDischargePlan:
     """Build a discharge plan from a horizon of atomic slots.
 
@@ -365,7 +388,7 @@ def plan_high_price_discharge(
     planner treats it as an opaque boundary: it never searches for the
     solar-recovery crossing itself.
     """
-    if not enabled and not trigger_1_enabled:
+    if not enabled and not trigger_1_enabled and not arbitrage_exports:
         return HighPriceDischargePlan(
             status=STATUS_DISABLED, reason=REASON_DISABLED, evaluation_time=now
         )
@@ -666,8 +689,93 @@ def plan_high_price_discharge(
             )
         remaining_usable_kwh -= assigned_kwh
 
+    if arbitrage_exports:
+        # Energy arbitrage bought to sell. It may only leave the battery when it
+        # is really there and the house keeps everything it is protected for, so
+        # the budget is what is left after the sales above and the protected
+        # demand. A plan made before the purchase simply finds no budget, and
+        # the next rebuild sees the energy arrive.
+        budget_left = max(0.0, remaining_usable_kwh - protected_demand_kwh - margin)
+        requests = []
+        for request in arbitrage_exports:
+            try:
+                if not (
+                    _aware(request.start)
+                    and _aware(request.end)
+                    and _finite(request.energy_kwh)
+                    and float(request.energy_kwh) > EPSILON
+                ):
+                    continue
+                req_start, req_end = _utc(request.start), _utc(request.end)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if req_end <= req_start:
+                continue
+            requests.append((req_start, req_end, float(request.energy_kwh)))
+
+        wanted: list[tuple[HorizonSlot, float]] = []
+        for slot in working:
+            if slot.export_price is None or not _finite(slot.export_price):
+                continue
+            if float(slot.export_price) <= 0.0:
+                continue
+            asked = 0.0
+            for req_start, req_end, energy in requests:
+                overlap = _duration_hours(max(slot.start, req_start), min(slot.end, req_end))
+                if overlap > EPSILON:
+                    asked += energy * overlap / _duration_hours(req_start, req_end)
+            if asked > EPSILON:
+                wanted.append((slot, asked))
+        # The dearest period first, so a short budget goes where it pays most.
+        wanted.sort(key=lambda item: (-float(item[0].export_price), item[0].start))
+
+        for slot, asked in wanted:
+            if budget_left <= EPSILON:
+                break
+            existing = next(
+                (a for a in allocations if a.start == slot.start and a.end == slot.end),
+                None,
+            )
+            capacity = max(
+                0.0,
+                _slot_capacity_kwh(slot, ceiling_w, total_discharge_power_w)
+                - (existing.energy_kwh if existing else 0.0),
+            )
+            take = min(asked, capacity, budget_left)
+            if take <= EPSILON:
+                continue
+            duration = slot.duration_hours
+            extra_w = take / duration * 1000.0 if duration > EPSILON else 0.0
+            if existing is not None:
+                allocations[allocations.index(existing)] = replace(
+                    existing,
+                    energy_kwh=existing.energy_kwh + take,
+                    power_w=existing.power_w + extra_w,
+                    arbitrage_kwh=existing.arbitrage_kwh + take,
+                )
+            else:
+                allocations.append(
+                    TriggerAllocation(
+                        start=slot.start,
+                        end=slot.end,
+                        export_price=float(slot.export_price),
+                        threshold=additional_cost,
+                        energy_kwh=take,
+                        power_w=extra_w,
+                        arbitrage_kwh=take,
+                    )
+                )
+            budget_left -= take
+            remaining_usable_kwh -= take
+
     if allocations:
         status, reason = STATUS_PLANNED, REASON_PLANNED
+    elif arbitrage_exports and not enabled and not trigger_1_enabled:
+        # Only arbitrage exports asked, and none could leave the battery: say
+        # what stopped it rather than reporting a feature that is not off.
+        status, reason = STATUS_NO_OPPORTUNITY, (
+            REASON_NO_USABLE_ENERGY if usable_energy_kwh <= EPSILON else REASON_NO_SURPLUS
+        )
     elif not enabled:
         status, reason = STATUS_NO_OPPORTUNITY, trigger_1_reason
     elif protected_demand_kwh <= EPSILON:

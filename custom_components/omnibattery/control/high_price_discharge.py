@@ -44,6 +44,7 @@ from ..pricing import PriceSlot
 from ..pricing.curtailment import distribute_solar_forecast
 from ..pricing.discharge_reserve import consumption_by_slot
 from ..pricing.high_price_discharge import (
+    ArbitrageExport,
     STATUS_FAIL_SAFE,
     STATUS_PLANNED,
     HighPriceDischargePlan,
@@ -170,11 +171,41 @@ class HighPriceDischargeManager:
         controller = self._controller
         return bool(
             (getattr(controller, "high_price_discharge_enabled", False)
-             or getattr(controller, "high_price_surplus_export_enabled", False))
+             or getattr(controller, "high_price_surplus_export_enabled", False)
+             or self._arbitrage_export_active())
             and getattr(controller, "predictive_charging_enabled", False)
             and not getattr(controller, "predictive_charging_overridden", False)
             and getattr(controller, "predictive_charging_mode", None)
             == PREDICTIVE_MODE_DYNAMIC_PRICING
+        )
+
+    def _arbitrage_export_active(self) -> bool:
+        """Arbitrage was asked to buy extra energy for a sale."""
+        controller = self._controller
+        return bool(
+            getattr(controller, "arbitrage_charging_enabled", False)
+            and getattr(controller, "arbitrage_export_enabled", False)
+        )
+
+    def _arbitrage_exports(self, now: datetime) -> tuple[ArbitrageExport, ...]:
+        """The sales the arbitrage plan is counting on, still ahead of ``now``.
+
+        Only a request: the planner decides whether the energy is really there
+        and the house is protected before releasing any of it.
+        """
+        controller = self._controller
+        schedule = getattr(controller, "_dynamic_pricing_schedule", None)
+        plan = getattr(schedule, "arbitrage_plan", None) or getattr(
+            controller, "_dp_last_arbitrage_plan", None
+        )
+        if plan is None or not getattr(plan, "planned", False):
+            return ()
+        return tuple(
+            ArbitrageExport(
+                self._aware(sale.start), self._aware(sale.end), float(sale.delivered_kwh)
+            )
+            for sale in plan.exports
+            if sale.end > now and sale.delivered_kwh > 0
         )
 
     def clear_runtime(self, reason: str = "cleanup") -> None:
@@ -286,6 +317,7 @@ class HighPriceDischargeManager:
             bool(getattr(controller, "high_price_surplus_export_enabled", False)),
             safety_margin,
             not bool(getattr(controller, "discharge_reserve_enabled", False)),
+            self._arbitrage_export_active(),
         )
 
     async def _fetch_solar_forecast(self) -> None:
@@ -340,7 +372,10 @@ class HighPriceDischargeManager:
             if now >= horizon_end:
                 horizon_end = pricing.energy_horizon_end(now)
             slots = self._build_horizon(pricing, now, horizon_end)
-            max_power_w, margin, trigger_2, trigger_1, safety_margin, chronological_coverage = config
+            (
+                max_power_w, margin, trigger_2, trigger_1, safety_margin,
+                chronological_coverage, arbitrage_export,
+            ) = config
             plan = plan_high_price_discharge(
                 slots,
                 pricing._curtailment_battery_snapshots(),
@@ -349,6 +384,7 @@ class HighPriceDischargeManager:
                 enabled=trigger_2,
                 trigger_1_enabled=trigger_1,
                 chronological_coverage=chronological_coverage,
+                arbitrage_exports=self._arbitrage_exports(now) if arbitrage_export else (),
                 safety_margin_kwh=safety_margin,
                 fill_slots=self._build_fill_slots(pricing, now, horizon_end) if trigger_1 else (),
                 additional_cost_per_kwh=margin,
@@ -638,4 +674,15 @@ class HighPriceDischargeManager:
                     ],
                 }
             )
+            # Only when arbitrage sells, so the status of every other
+            # configuration stays exactly what it was.
+            arbitrage_kwh = float(getattr(plan, "arbitrage_kwh", 0.0) or 0.0)
+            if arbitrage_kwh > 0:
+                status["arbitrage_kwh"] = round(arbitrage_kwh, 3)
+                for entry, allocation in zip(status["allocations"], plan.allocations):
+                    entry["arbitrage_kwh"] = round(
+                        getattr(allocation, "arbitrage_kwh", 0.0), 3
+                    )
+        if self._arbitrage_export_active():
+            status["arbitrage_export_enabled"] = True
         self._status = status
