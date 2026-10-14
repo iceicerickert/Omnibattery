@@ -715,3 +715,80 @@ def test_the_engine_plans_less_when_the_sale_floor_and_margin_are_higher():
         asyncio.run(manager._evaluate_dynamic_pricing(horizon=_daily()))
         results.append(ctrl._dp_last_arbitrage_plan.export_kwh)
     assert results[0] > results[1]
+
+
+# ---------------------------------------------------------------------------
+# The sale plan follows a changed arbitrage plan at once
+# ---------------------------------------------------------------------------
+
+
+def _rebuild_counter(monkeypatch, manager, controller):
+    from custom_components.omnibattery.control import high_price_discharge as module
+
+    calls = []
+
+    def fake_plan(*args, **kwargs):
+        calls.append(kwargs.get("arbitrage_exports"))
+        return SimpleNamespace(
+            status="planned", reason="x", total_allocated_kwh=0.0, arbitrage_kwh=0.0,
+            allocations=(), horizon_end=None, protected_demand_kwh=0.0,
+            usable_energy_kwh=0.0, trigger_1_budget_kwh=0.0, refill_price=None,
+            trigger_1_reason=None,
+        )
+
+    monkeypatch.setattr(module, "plan_high_price_discharge", fake_plan)
+    controller._pricing_mgr = SimpleNamespace(
+        energy_horizon_end=lambda now: NOW + timedelta(hours=16),
+        _curtailment_battery_snapshots=lambda: [],
+    )
+    manager._build_horizon = lambda *a, **k: []
+    manager._build_fill_slots = lambda *a, **k: ()
+    return calls
+
+
+def test_a_new_arbitrage_sale_rebuilds_the_sale_plan_without_waiting(monkeypatch):
+    manager, controller, plan = _sale_manager()
+    calls = _rebuild_counter(monkeypatch, manager, controller)
+    config = manager._config()
+
+    # The first rebuild happens before any arbitrage plan exists...
+    saved = (controller._dynamic_pricing_schedule, controller._dp_last_arbitrage_plan)
+    controller._dynamic_pricing_schedule = None
+    controller._dp_last_arbitrage_plan = None
+    manager._maybe_rebuild(config)
+    assert calls == [()]
+
+    # ...and the same config a moment later does not rebuild again...
+    manager._maybe_rebuild(config)
+    assert len(calls) == 1
+
+    # ...until the arbitrage plan arrives, which must be picked up at once.
+    controller._dynamic_pricing_schedule, controller._dp_last_arbitrage_plan = saved
+    manager._maybe_rebuild(config)
+    assert len(calls) == 2
+    assert calls[1]
+
+    # An identical plan does not keep rebuilding.
+    manager._maybe_rebuild(config)
+    assert len(calls) == 2
+
+
+def test_a_changed_sale_amount_rebuilds_but_a_rounding_change_does_not(monkeypatch):
+    manager, controller, plan = _sale_manager()
+    calls = _rebuild_counter(monkeypatch, manager, controller)
+    config = manager._config()
+    manager._maybe_rebuild(config)
+    n = len(calls)
+
+    original = plan.exports
+    from dataclasses import replace
+
+    nudged = tuple(replace(d, delivered_kwh=d.delivered_kwh + 0.01) for d in original)
+    object.__setattr__(plan, "discharges", nudged + tuple(d for d in plan.discharges if d.kind != "export"))
+    manager._maybe_rebuild(config)
+    assert len(calls) == n  # a hundredth of a kWh is noise
+
+    bigger = tuple(replace(d, delivered_kwh=d.delivered_kwh + 1.0) for d in original)
+    object.__setattr__(plan, "discharges", bigger + tuple(d for d in plan.discharges if d.kind != "export"))
+    manager._maybe_rebuild(config)
+    assert len(calls) == n + 1

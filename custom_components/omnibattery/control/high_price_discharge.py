@@ -346,14 +346,23 @@ class HighPriceDischargeManager:
                           monotonic() - self._solar_wh_fetched_mono >= SOLAR_REFRESH_INTERVAL_S):
             if self._solar_fetch_task is None or self._solar_fetch_task.done():
                 self._solar_fetch_task = self._hass.async_create_task(self._fetch_solar_forecast())
+        # A new or changed arbitrage sale must not wait out the throttle: the
+        # plan it asks for would otherwise miss up to five minutes of the hours
+        # it was made for.
+        requests = self._arbitrage_exports(self._now()) if config[-1] else ()
+        signature = tuple(
+            (request.start, round(request.energy_kwh, 1)) for request in requests
+        )
         due = (
             self._plan is None
             or self._last_rebuild_mono is None
             or self._plan_config != config
+            or getattr(self, "_plan_requests", ()) != signature
             or monotonic() - self._last_rebuild_mono >= REBUILD_INTERVAL_S
         )
         if not due:
             return
+        self._plan_requests = signature
 
         self._last_rebuild_mono = monotonic()
         self._plan_config = config
@@ -384,7 +393,7 @@ class HighPriceDischargeManager:
                 enabled=trigger_2,
                 trigger_1_enabled=trigger_1,
                 chronological_coverage=chronological_coverage,
-                arbitrage_exports=self._arbitrage_exports(now) if arbitrage_export else (),
+                arbitrage_exports=requests,
                 safety_margin_kwh=safety_margin,
                 fill_slots=self._build_fill_slots(pricing, now, horizon_end) if trigger_1 else (),
                 additional_cost_per_kwh=margin,
